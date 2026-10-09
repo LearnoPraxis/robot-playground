@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RobotArm, HOME_POSE, type PandaJointAngles, type RobotMode } from "./components/RobotArm";
 import { ControlPanel } from "./components/ControlPanel";
 import { useWebSocket } from "./hooks/useWebSocket";
@@ -16,18 +16,71 @@ export default function App() {
   const [displayPlaying, setDisplayPlaying] = useState(true);
   const [mode, setMode] = useState<RobotMode>("interactive");
   const [activeTab, setActiveTab] = useState<Tab>("robot");
+  const [localPlayback, setLocalPlayback] = useState(false);
+  const [localIndex, setLocalIndex] = useState(0);
+  const playbackTimerRef = useRef<number | null>(null);
 
   const { state, connect, sendTaskId, reset } = useWebSocket(WS_URL);
 
-  // 仅在播放状态下应用接收到的帧
+  // 实时流：WebSocket 帧到达时应用最后一帧
   useEffect(() => {
-    if (state.actions.length > 0 && displayPlaying) {
+    if (state.isPlaying && state.actions.length > 0 && displayPlaying) {
       const last = state.actions[state.actions.length - 1];
       if (last && last.length >= 8) {
         setJointAngles([...last.slice(0, 8)] as PandaJointAngles);
       }
     }
-  }, [state.actions, displayPlaying]);
+  }, [state.actions, state.isPlaying, displayPlaying]);
+
+  // 本地回放：从已存储的 actions 按帧逐步播放
+  useEffect(() => {
+    if (!localPlayback || state.actions.length === 0) {
+      if (playbackTimerRef.current) {
+        clearInterval(playbackTimerRef.current);
+        playbackTimerRef.current = null;
+      }
+      return;
+    }
+    // 从第 0 帧开始
+    setLocalIndex(0);
+    playbackTimerRef.current = window.setInterval(() => {
+      setLocalIndex((idx) => {
+        const next = idx + 1;
+        if (next >= state.actions.length) {
+          if (playbackTimerRef.current) {
+            clearInterval(playbackTimerRef.current);
+            playbackTimerRef.current = null;
+          }
+          setLocalPlayback(false);
+          return idx;
+        }
+        return next;
+      });
+    }, 33); // ~30 FPS
+    return () => {
+      if (playbackTimerRef.current) {
+        clearInterval(playbackTimerRef.current);
+        playbackTimerRef.current = null;
+      }
+    };
+  }, [localPlayback, state.actions.length]);
+
+  // 本地回放：应用当前帧
+  useEffect(() => {
+    if (localPlayback && localIndex >= 0 && localIndex < state.actions.length) {
+      const frame = state.actions[localIndex];
+      if (frame && frame.length >= 8) {
+        setJointAngles([...frame.slice(0, 8)] as PandaJointAngles);
+      }
+    }
+  }, [localPlayback, localIndex, state.actions]);
+
+  // 本地回放启动时切换到 replay 模式
+  useEffect(() => {
+    if (localPlayback && mode !== "replay") {
+      setMode("replay");
+    }
+  }, [localPlayback, mode]);
 
   // 回放完成后自动切回交互模式
   useEffect(() => {
@@ -35,15 +88,18 @@ export default function App() {
       mode === "replay" &&
       state.frameCount > 0 &&
       state.currentFrame >= state.frameCount - 1 &&
-      !state.isPlaying
+      !state.isPlaying &&
+      !localPlayback
     ) {
       setMode("interactive");
     }
-  }, [mode, state.frameCount, state.currentFrame, state.isPlaying]);
+  }, [mode, state.frameCount, state.currentFrame, state.isPlaying, localPlayback]);
 
   const handleSend = async (instruction: string) => {
     setLoading(true);
     setApiError(null);
+    setLocalPlayback(false);
+    setLocalIndex(0);
     try {
       const res = await fetch(`${API_BASE}/infer`, {
         method: "POST",
@@ -70,13 +126,21 @@ export default function App() {
   };
 
   const handlePlayPause = () => {
-    setDisplayPlaying((p) => !p);
+    // 实时流完成后，启动本地回放
+    if (!state.isPlaying && state.actions.length > 0) {
+      setLocalPlayback((p) => !p);
+    } else {
+      // 实时流中，切换显示暂停/继续
+      setDisplayPlaying((p) => !p);
+    }
   };
 
   const handleReset = () => {
     reset();
     setJointAngles(HOME_POSE);
     setMode("interactive");
+    setLocalPlayback(false);
+    setLocalIndex(0);
   };
 
   return (
@@ -159,9 +223,9 @@ export default function App() {
           <ControlPanel
             onSend={handleSend}
             status={state.status}
-            isPlaying={state.isPlaying && displayPlaying}
+            isPlaying={state.isPlaying ? state.isPlaying && displayPlaying : localPlayback}
             frameCount={state.frameCount}
-            currentFrame={state.currentFrame}
+            currentFrame={localPlayback ? localIndex : state.currentFrame}
             error={state.error ?? apiError}
             onPlayPause={handlePlayPause}
             onReset={handleReset}
