@@ -120,7 +120,7 @@ export function RobotArm({ jointAngles, onJointAnglesChange, mode }: RobotArmPro
       <MujocoCanvas
         config={SCENE_CONFIG}
         shadows
-        camera={{ position: [2, 2, 3], fov: 45 }}
+        camera={{ position: [2.5, 1.0, 1.5], fov: 50 }}
         style={{ width: "100%", height: "100%" }}
       >
         <Scene
