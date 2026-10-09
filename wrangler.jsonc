@@ -1,0 +1,19 @@
+{
+  "name": "robot-playground",
+  "main": "src/main.py",
+  "compatibility_date": "2026-09-30",
+  "compatibility_flags": ["python_workers"],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "WSStream", "name": "WS_STREAM" }
+    ]
+  },
+  "migrations": [
+    { "new_sqlite_classes": ["WSStream"], "tag": "v1" }
+  ]
+}

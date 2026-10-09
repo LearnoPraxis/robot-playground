@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+src/node_modules/
+
+# Build output
+frontend/dist/
+public/assets/
+
+# Wrangler
+.wrangler/
+wrangler.toml.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pyodide/
+
+# Environment
+.env
+.env.local
+*.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+.trae/cache/
+
+# Pyodide cross-build env
+.xbuildenv/
+
+# Temp files
+mm_temp.zip
+*.tmp
+
+# Python compiled modules (regenerated during deployment)
+python_modules/
