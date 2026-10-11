@@ -33,10 +33,23 @@ const ARM_LABELS = ['j0', 'j1', 'j2', 'j3', 'j4', 'j5', 'j6'] as const;
 export interface TelemetryFrame {
   /** 仿真时间（秒） */
   t: number;
+  /** 墙钟时间（秒，相对录制开始） */
+  wt: number;
   /** 采样序号 */
   i: number;
+  /** 采样发生在第几个物理步（用于反推 timestep） */
+  step: number;
   /** 该时刻起作用的帧指令（长度 8：7 关节 + 夹爪） */
   cmd: number[];
+  /**
+   * 物理步发生时 **anglesRef 的瞬时值**。
+   * 与 cmd 分开记录，用于区分"命令值错位"与"命令本身有问题"。
+   */
+  cmdLive: number[];
+  /** 该指令对应的流帧序号（-1 = 还没收到任何帧） */
+  cmdi: number;
+  /** 指令自上次变化以来经过的物理时间（秒）—— 用于判断命令龄/错位 */
+  cmdage: number;
   /** 实际关节角（rad，来自 data.qpos） */
   arm: number[];
   /** 实际夹爪指节位置（m） */
@@ -62,7 +75,22 @@ export interface JointTracking {
 export interface TelemetryMetrics {
   /** 仿真时长（秒） */
   duration: number;
+  /** 墙钟时长（秒） */
+  wallDuration: number;
+  /** 仿真时间 / 墙钟时间。<1 表示仿真跑不动（实时因子） */
+  realTimeFactor: number;
+  /** 采样点数量 */
   frames: number;
+  /** 物理步长（model.opt.timestep），由采样间隔反推，用于核对 */
+  physicsTimestep: number;
+  /** 平均采样间隔（物理时间，秒） */
+  sampleInterval: number;
+  /** 仿真实际步进频率（Hz） */
+  stepRate: number;
+  /** 平均命令龄（秒）：采样时手上的指令已经生效了多久 */
+  meanCmdAge: number;
+  /** 收到过多少帧流指令 */
+  streamFrames: number;
   joints: JointTracking[];
   /** 7 个关节里最大的平均跟踪误差 */
   worstJointMeanErr: number;
@@ -100,6 +128,8 @@ interface MutableRun {
   instruction: string;
   taskId: string;
   source: 'ws' | 'local' | 'manual';
+  /** 录制起点的墙钟毫秒（performance.now 不可序列化，用 Date.now） */
+  wallStart: number;
   frames: TelemetryFrame[];
 }
 
@@ -132,6 +162,16 @@ let stepCounter = 0;
 let sampleIndex = 0;
 /** 最后一次收到帧指令（长度 8）。 */
 let lastCmd: number[] | null = null;
+/** 当前生效的指令来自第几帧流（-1 = 尚未收到）。 */
+let cmdSeq = -1;
+/** 当前指令是在哪个物理步生效的，用于算"命令龄"。 */
+let cmdSetStep = 0;
+/** 累计收到的流帧数。 */
+let streamFrames = 0;
+/** 上一次被记录的指令值，用于变化检测。 */
+let lastNoted: number[] | null = null;
+/** 当前指令对应的流帧序号。 */
+let lastFrameIndex = -1;
 /** 结算定时器句柄。 */
 let settleTimer: number | null = null;
 /** 上一段落盘的结果，供 UI 展示与下载。 */
@@ -183,9 +223,30 @@ export function getLastRun(): TelemetryRun | null {
   return lastRun;
 }
 
-/** 由 Scene 在每次收到 WS 帧、写入 actuator 之前调用。 */
-export function noteCommand(cmd: number[]) {
+/**
+ * 由 Scene 在每次收到 WS 帧、写入 actuator 之前调用。
+ *
+ * 注意：Scene 的物理步回调每步都会调用它，所以这里**必须做变化检测**——
+ * 只有指令值真正变化时才推进序号，否则 streamFrames 会把"物理步数"
+ * 当成"收到的帧数"。
+ */
+export function noteCommand(cmd: number[], frameIndex = -1) {
   lastCmd = cmd.slice(0, 8);
+  lastFrameIndex = frameIndex;
+  if (lastNoted !== null && sameCmd(lastNoted, lastCmd)) return;
+  lastNoted = lastCmd.slice();
+  cmdSeq += 1;
+  streamFrames += 1;
+  cmdSetStep = stepCounter;
+}
+
+function sameCmd(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    // 帧值来自 JSON，比较到 1e-6 即可
+    if (Math.abs(a[i] - b[i]) > 1e-6) return false;
+  }
+  return true;
 }
 
 /** App 在本地回放开关变化时调用，用于把回放帧排除在采样之外。 */
@@ -207,11 +268,17 @@ export function beginTelemetry(opts: {
     instruction: opts.instruction,
     taskId: opts.taskId,
     source: opts.source,
+    wallStart: Date.now(),
     frames: [],
   };
   stepCounter = 0;
   sampleIndex = 0;
   lastCmd = null;
+  lastNoted = null;
+  cmdSeq = -1;
+  streamFrames = 0;
+  cmdSetStep = 0;
+  lastFrameIndex = -1;
   emit();
 }
 
@@ -238,10 +305,11 @@ export function finishTelemetryNow() {
 
 function finish() {
   if (!current) return;
+  const wallDuration = (Date.now() - current.wallStart) / 1000;
   const run: TelemetryRun = {
     ...current,
     finishedAt: new Date().toISOString(),
-    metrics: computeMetrics(current.frames),
+    metrics: computeMetrics(current.frames, wallDuration),
   };
   lastRun = run;
   current = null;
@@ -257,6 +325,8 @@ export function recordPhysicsStep(data: {
   xpos: ArrayLike<number>;
   ncon: number;
   timestep: number;
+  /** 本物理步 anglesRef 的瞬时值（长度 8） */
+  liveCmd: number[];
 }) {
   if (!current || !bindings) return;
   if (localReplayActive) return;
@@ -280,8 +350,13 @@ export function recordPhysicsStep(data: {
 
   current.frames.push({
     t: round(data.time, 4),
+    wt: round((Date.now() - current.wallStart) / 1000, 4),
     i: sampleIndex++,
+    step: stepCounter,
     cmd: (lastCmd ?? []).slice(),
+    cmdLive: data.liveCmd.slice(0, 8),
+    cmdi: lastFrameIndex,
+    cmdage: round((stepCounter - cmdSetStep) * data.timestep, 4),
     arm,
     grip,
     gripCmd: round(data.ctrl[b.gripperCtrlAdr], 1),
@@ -325,12 +400,20 @@ function dist(a: number[], b: number[]): number {
   return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 }
 
-function computeMetrics(frames: TelemetryFrame[]): TelemetryMetrics | null {
+function computeMetrics(frames: TelemetryFrame[], wallDuration: number): TelemetryMetrics | null {
   if (frames.length === 0) return null;
 
   const withCmd = frames.filter((f) => f.cmd.length >= 8);
   const first = frames[0];
   const last = frames[frames.length - 1];
+  const duration = last.t - first.t;
+  const sampleInterval = frames.length > 1 ? duration / (frames.length - 1) : 0;
+  // 采样每 SAMPLE_EVERY_N_STEPS 个物理步一次 → 反推物理步长
+  const physicsTimestep = sampleInterval > 0 ? sampleInterval / SAMPLE_EVERY_N_STEPS : 0;
+  const stepRate = physicsTimestep > 0 ? 1 / physicsTimestep : 0;
+  // 平均命令龄：反映"采样时手上的指令有多旧"，越接近帧间隔越正常
+  const cmdages = withCmd.map((f) => f.cmdage).filter((v) => v > 0);
+  const meanCmdAge = cmdages.length > 0 ? cmdages.reduce((a, b) => a + b, 0) / cmdages.length : 0;
 
   // --- 关节跟踪误差：实际 qpos 与下发帧指令之差 ---
   const joints: JointTracking[] = ARM_LABELS.map((name, j) => {
@@ -378,8 +461,15 @@ function computeMetrics(frames: TelemetryFrame[]): TelemetryMetrics | null {
   }
 
   return {
-    duration: round(last.t - first.t, 3),
+    duration: round(duration, 3),
+    wallDuration: round(wallDuration, 3),
+    realTimeFactor: wallDuration > 0 ? round(duration / wallDuration, 3) : 0,
     frames: frames.length,
+    physicsTimestep: round(physicsTimestep, 5),
+    sampleInterval: round(sampleInterval, 4),
+    stepRate: round(stepRate, 1),
+    meanCmdAge: round(meanCmdAge, 4),
+    streamFrames,
     joints,
     worstJointMeanErr: round(Math.max(...joints.map((j) => j.meanErr)), 4),
     gripperTravel,
@@ -399,7 +489,14 @@ export function describeRun(run: TelemetryRun): string[] {
   const m = run.metrics;
   if (!m) return ['没有采集到任何物理帧。'];
 
-  out.push(`采集 ${m.frames} 帧 / ${m.duration}s（来源 ${run.source}，任务 ${run.taskId || 'n/a'}）`);
+  out.push(
+    `采集 ${m.frames} 帧 / 仿真 ${m.duration}s / 墙钟 ${m.wallDuration}s` +
+      `（实时因子 ${m.realTimeFactor}，来源 ${run.source}，任务 ${run.taskId || 'n/a'}）`,
+  );
+  out.push(
+    `仿真步长 ${m.physicsTimestep}s（${m.stepRate} Hz），采样间隔 ${m.sampleInterval}s，` +
+      `收到流帧 ${m.streamFrames} 帧，平均命令龄 ${m.meanCmdAge}s`,
+  );
 
   const worst = m.joints.reduce((a, b) => (b.meanErr > a.meanErr ? b : a), m.joints[0]);
   out.push(

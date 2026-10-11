@@ -51,6 +51,8 @@ interface RobotArmProps {
   mode: RobotMode;
   /** 递增信号，变化时触发 MuJoCo 场景重置 */
   resetSignal?: number;
+  /** 当前下发指令对应的流帧序号（遥测用） */
+  frameIndexRef?: { current: number };
 }
 
 /** 加载中指示器 */
@@ -67,7 +69,7 @@ function LoadingIndicator() {
 const TELEMETRY_BODIES = ["ball", "cube"] as const;
 
 /** 场景内部组件 */
-function Scene({ jointAngles, mode, resetSignal }: RobotArmProps) {
+function Scene({ jointAngles, mode, resetSignal, frameIndexRef }: RobotArmProps) {
   const { camera } = useThree();
   const { isPending, isReady, isError, error, api } = useMujoco();
   const wasm = useMujocoWasm();
@@ -139,7 +141,7 @@ function Scene({ jointAngles, mode, resetSignal }: RobotArmProps) {
   /** 物理步进前：记录本帧下发的目标（遥测的"期望"侧）。 */
   useBeforePhysicsStep(() => {
     if (modeRef.current === "replay" && isRecording()) {
-      noteCommand(anglesRef.current);
+      noteCommand(anglesRef.current, frameIndexRef?.current ?? -1);
     }
   });
 
@@ -154,6 +156,7 @@ function Scene({ jointAngles, mode, resetSignal }: RobotArmProps) {
       xpos: data.xpos,
       ncon: data.ncon ?? 0,
       timestep: model.opt?.timestep ?? 0.002,
+      liveCmd: anglesRef.current,
     });
   });
 
@@ -270,7 +273,13 @@ function Scene({ jointAngles, mode, resetSignal }: RobotArmProps) {
 }
 
 /** 机器人机械臂组件（MuJoCo 物理仿真） */
-export function RobotArm({ jointAngles, onJointAnglesChange, mode, resetSignal }: RobotArmProps) {
+export function RobotArm({
+  jointAngles,
+  onJointAnglesChange,
+  mode,
+  resetSignal,
+  frameIndexRef,
+}: RobotArmProps) {
   return (
     <MujocoProvider>
       <MujocoCanvas
@@ -284,6 +293,7 @@ export function RobotArm({ jointAngles, onJointAnglesChange, mode, resetSignal }
           onJointAnglesChange={onJointAnglesChange}
           mode={mode}
           resetSignal={resetSignal}
+          frameIndexRef={frameIndexRef}
         />
       </MujocoCanvas>
     </MujocoProvider>

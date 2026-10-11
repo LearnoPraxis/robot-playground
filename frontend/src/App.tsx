@@ -18,6 +18,8 @@ export default function App() {
   const [localIndex, setLocalIndex] = useState(0);
   const [resetCounter, setResetCounter] = useState(0);
   const playbackTimerRef = useRef<number | null>(null);
+  /** 当前下发指令对应的流帧序号（遥测用，避免每帧触发重渲染） */
+  const streamFrameIndexRef = useRef(-1);
   /** 传给 useWebSocket 的遥测标签（指令已归一化，这里只想记录原始指令） */
   const telemetryLabelRef = useRef<{ instruction: string; taskId: string }>({
     instruction: "",
@@ -37,6 +39,7 @@ export default function App() {
     if (state.isPlaying && state.actions.length > 0 && displayPlaying) {
       const last = state.actions[state.actions.length - 1];
       if (last && last.length >= 8) {
+        streamFrameIndexRef.current = state.actions.length - 1;
         setJointAngles([...last.slice(0, 8)] as PandaJointAngles);
       }
     }
@@ -198,6 +201,7 @@ export default function App() {
             onJointAnglesChange={setJointAngles}
             mode={mode}
             resetSignal={resetCounter}
+            frameIndexRef={streamFrameIndexRef}
           />
         </div>
 
