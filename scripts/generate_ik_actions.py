@@ -143,6 +143,11 @@ def mat_to_quat(mat):
 # ── 抓取姿态度量 ──
 left_finger_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_finger")
 right_finger_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_finger")
+_finger_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "finger_joint1")
+finger_qposadr = model.jnt_qposadr[_finger_jid] if _finger_jid >= 0 else -1
+# 指垫相对手指中心向内的偏移（来自 panda.xml 的 fingertip_pad_collision_1:
+# pos="0 0.0055 0.0445"）。指垫在内侧面，所以指垫间距 = 指间距 - 2×该偏移。
+PAD_INNER_OFFSET = 0.0055
 
 
 def tool_tilt_deg():
@@ -160,25 +165,46 @@ def finger_height_gap_mm():
     return abs(float(data.xpos[left_finger_bid][2] - data.xpos[right_finger_bid][2])) * 1000.0
 
 
-def report_grasp_quality(traj, label=""):
-    """报告抓取帧的夹爪姿态质量 —— 这是"能不能夹住"的硬指标。
+def report_grasp_quality(traj, label="", half_width=None):
+    """报告抓取帧的夹爪姿态与开合行程 —— 这是"能不能夹住"的硬指标。
 
-    倾斜角 0° 表示夹爪严格竖直。倾斜越大，两指越是一高一低，
-    对**矮**物体就越夹不住：倾斜约 32° 时两指高度差约 19mm，
-    而原来的 5cm 立方体半高只有 25mm → 两指无法同时贴住侧面。
+    两个判据：
+    1. **夹持行程**：指垫必须能从张开位置向内移动一段距离才碰到物体侧面。
+       若物体太宽（接近 8cm 总开口），指垫几乎不用动就贴上了，等于"碰一下"
+       而不是"夹住"——这是 6cm 方箱实测失败的原因。
+    2. **两指高度差**：夹爪倾斜会让两指一高一低，物体越矮越致命。
     """
     close_idx = next((i for i, r in enumerate(traj) if r[7] < 0.5), None)
     if close_idx is None:
         return
     set_arm_qpos(traj[close_idx][:7])
+
+    # 完全张开时的指垫间距
+    closed_q = get_arm_qpos()
+    data.qpos[finger_qposadr] = 0.04
+    data.qpos[finger_qposadr + 1] = 0.04
+    mujoco.mj_forward(model, data)
+    if left_finger_bid >= 0 and right_finger_bid >= 0:
+        open_pad = abs(float(np.linalg.norm(data.xpos[left_finger_bid] - data.xpos[right_finger_bid]))) - 2 * PAD_INNER_OFFSET
+    else:
+        open_pad = -1.0
+    set_arm_qpos(closed_q)
+
     tilt = tool_tilt_deg()
     gap = finger_height_gap_mm()
     tcp = get_tcp_pos()
+    hw = CUBE_HALF[0] if half_width is None else half_width
+    bite = open_pad / 2 - hw if open_pad > 0 else -1.0
     height_mm = 2.0 * CUBE_HALF_Z * 1000.0
-    ok = gap >= 0 and gap < height_mm * 0.5
-    status = "✓" if ok else "✗ 两指差相对物体过高，可能夹不住"
+
+    ok_bite = bite > 0.008
+    ok_h = gap >= 0 and gap < height_mm * 0.5
+    status = "✓" if (ok_bite and ok_h) else "✗ " + (
+        "夹持行程不足(会滑脱) " if not ok_bite else "") + (
+        "两指高度差相对物体过高" if not ok_h else "")
     print(f"    [抓取质量 {label}] 闭合帧={close_idx} 倾斜={tilt:.1f}° "
-          f"两指高度差={gap:.1f}mm（物体高 {height_mm:.0f}mm）"
+          f"两指高度差={gap:.1f}mm 张开指垫间距={open_pad * 100:.2f}cm "
+          f"单侧夹持行程={bite * 100:.2f}cm（物体宽 {hw * 200:.1f}cm / 高 {height_mm:.0f}mm）"
           f" TCP=({tcp[0]:.3f},{tcp[1]:.3f},{tcp[2]:.3f}) {status}")
 
 # ── DLS IK 求解器（两阶段 + 步长限制 + 逐帧雅可比限幅）──
