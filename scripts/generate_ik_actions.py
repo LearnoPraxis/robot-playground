@@ -74,6 +74,11 @@ def get_tcp_pos():
     return data.site_xpos[tcp_id].copy()
 
 # ── 轨迹参数 ──
+# 显式初值池：供 solve_ik 作为额外候选起点。**按固定顺序 append**，
+# 且 solve_ik 只读其快照，从而保证"同一目标在同一调用时机得到同一结果"。
+# 绝不要改成读 globals() —— 那会让结果依赖已算出几个关键帧。
+_SEED_POOL = []
+
 FRAMES = 60            # 默认帧数（推球等平滑任务）
 DURATION = 2.0         # 名义时长（秒），仅写入 JSON 元数据
 FRAME_DT = 0.03        # 服务端实际帧间隔（见 src/ws_stream.py 的 _FRAME_INTERVAL）
@@ -338,13 +343,23 @@ def solve_ik(target_pos, target_mat=None, max_iter=500, damping=0.1, tol=1e-4,
     # 位置-only（3-DOF）常常直接给出"位置准 + 夹爪朝下"的解；而 6-DOF 阶段在
     # 朝向误差接近 π 时是不稳定平衡，会把好解推成"夹爪朝上"的坏解。
     # 实测同一目标：位置-only 得 pos=0.0005 / 朝下；走 6-DOF 变成 ori_err=3.11 / 朝上。
-    # 初值列表：两个永远可用的 + 已算出的其它关键帧（帮助落在正确分支）。
-    seeds = [warm_start, home_qpos]
-    for _name in ("ik_ball_touch", "ik_push_forward", "ik_ball_above",
-                  "ik_cube_above", "ik_cube_touch", "ik_shelf_above"):
-        _v = globals().get(_name)
-        if _v is not None:
-            seeds.append(_v)
+    #
+    # ── 可复现性修复（2026-10-11）──
+    # 此前用 globals().get("ik_cube_above") 之类"顺便"收集已算出的关键帧当初值，
+    # 导致**同一个目标在不同调用时机得到不同的候选集合**，从而解出不同结果
+    # （实测 place_shelf 复用 pick 的抓取段后从第 29 帧起分叉、方块不再被抬起）。
+    # 现在改为：warm_start 为空时**显式**用 home 起算，再拼接显式的 _SEED_POOL
+    # 快照，不再读 globals()，也不再依赖调用前的手臂残留状态。
+    seeds = [warm_start if warm_start is not None else home_qpos, home_qpos]
+    seeds.extend(_SEED_POOL)
+    _uniq = []
+    for _s in seeds:
+        if _s is None:
+            continue
+        _arr = np.asarray(_s, dtype=float)
+        if not any(np.array_equal(_arr, _t) for _t in _uniq):
+            _uniq.append(_arr)
+    seeds = _uniq
 
     candidates = attempt_positions(seeds)
 
@@ -416,12 +431,17 @@ def generate_trajectory(keyframes, frames=60):
             traj.append([round(v, 4) for v in keyframes[-1][1]])
     return traj
 
-def cartesian_segment(start_pos, end_pos, target_mat, n_frames, gripper, label="", scale=1.0):
+def cartesian_segment(start_pos, end_pos, target_mat, n_frames, gripper, label="",
+                      scale=1.0, first_seed=None):
     """笛卡尔空间直线插值：逐帧 IK 求解，TCP 沿直线移动。
 
     **连续性**：第一帧把 TCP 放到 start_pos 并记录得到的关节解，后续帧以
     上一帧的解为 warm_start。这样段内不会跳构型分支。
     scale 用于整体放慢（帧数按比例放大）。
+
+    first_seed：第 0 帧的**显式**求解起点。必须传，否则该帧的起点取决于
+    solve_ik 内部的初值池，同一段在两处调用可能解出不同结果
+    （实测 place_shelf 复用抓取段时与 pick_cube 从第 34 帧起分叉）。
     """
     n_frames = max(2, int(round(n_frames * scale)))
     segment = []
@@ -429,7 +449,8 @@ def cartesian_segment(start_pos, end_pos, target_mat, n_frames, gripper, label="
     for i in range(n_frames):
         t = ease_in_out(i / max(n_frames - 1, 1))
         pos = [start_pos[k] + (end_pos[k] - start_pos[k]) * t for k in range(3)]
-        q_arm = solve_ik(pos, target_mat, warm_start=prev_q)
+        seed = prev_q if prev_q is not None else first_seed
+        q_arm = solve_ik(pos, target_mat, warm_start=seed)
         prev_q = q_arm.copy()
         segment.append([round(v, 4) for v in list(q_arm) + [gripper]])
     # 验证首末帧朝向
@@ -635,46 +656,52 @@ if MAT[2, 2] > 0:
 
 # 小球（推球只需位置控制，不约束朝向）
 print("  小球上方:")
-set_arm_qpos(home_qpos)
 ik_ball_above = solve_ik([BALL_POS[0], BALL_POS[1], GRASP_ABOVE_Z])
+_SEED_POOL.append(ik_ball_above)
 
 print("  接触小球:")
 ik_ball_touch = solve_ik(BALL_POS, warm_start=ik_ball_above)
+_SEED_POOL.append(ik_ball_touch)
 
 print("  推球向左终点:")
 ik_push_left = solve_ik([BALL_POS[0] - 0.15, BALL_POS[1] - 0.2, BALL_POS[2]],
                         warm_start=ik_ball_touch)
+_SEED_POOL.append(ik_push_left)
 
 print("  推球向右终点:")
 ik_push_right = solve_ik([BALL_POS[0] - 0.15, BALL_POS[1] + 0.2, BALL_POS[2]],
                          warm_start=ik_ball_touch)
+_SEED_POOL.append(ik_push_right)
 
 print("  推球向前终点:")
 ik_push_forward = solve_ik([BALL_POS[0] + 0.2, BALL_POS[1], BALL_POS[2]],
                            warm_start=ik_ball_touch)
+_SEED_POOL.append(ik_push_forward)
 
 # ── 立方体 ──
 # 关键：DLS 的 3-DOF 位置阶段只有约 166 次迭代，从 home 出发到不了立方体上方
 # （会被夹爪朝向分支带偏，实测 ori_err≈3.14）。
-# 原脚本是靠"上一个 solve 残留的机械臂状态"碰巧得到好初值，属于隐式依赖；
-# 这里改为**用显式初值**：立方体在球的 +y 侧，用推球终点附近的解当种子，
-# 位置阶段只需走很短一段。
+# 立方体在球的 +y 侧，用推球终点附近的解当种子，位置阶段只需走很短一段。
 ik_cube_above = solve_ik([CUBE_POS[0], CUBE_POS[1], GRASP_ABOVE_Z], MAT,
                          warm_start=ik_push_forward)
+_SEED_POOL.append(ik_cube_above)
 verify_tcp("cube_above")
 
 print("  接触立方体（抓取）:")
 ik_cube_touch = solve_ik(CUBE_POS, MAT, warm_start=ik_cube_above)
+_SEED_POOL.append(ik_cube_touch)
 verify_tcp("cube_touch")
 
 print("  抬起立方体:")
 ik_cube_lift = solve_ik([CUBE_POS[0], CUBE_POS[1], CUBE_LIFT_Z], MAT, warm_start=ik_cube_touch)
+_SEED_POOL.append(ik_cube_lift)
 verify_tcp("cube_lift")
 
 # 货架
 print("  货架上方（预放置）:")
 ik_shelf_above = solve_ik([SHELF_SURFACE[0], SHELF_SURFACE[1], 0.25], MAT,
                           warm_start=ik_cube_lift)
+_SEED_POOL.append(ik_shelf_above)
 verify_tcp("shelf_above")
 
 print("  货架表面（放置）:")
@@ -725,21 +752,17 @@ def build_pick_segments(scale=1.0, keep_holding=False):
     s1 = joint_segment(home_qpos, ik_cube_above, n1, GRIPPER_OPEN, scale=scale)
 
     n2 = frames_for_steps(joint_delta(ik_cube_above, ik_cube_touch), min_frames=6)
-    # 关键：把手臂**显式**摆到 ik_cube_above 再开始笛卡尔接近段。
-    # cartesian_segment 用"上一帧解"作 warm_start，如果它的起点依赖调用前
-    # 手臂的残留状态，同一段在 pick_cube 与 place_shelf 里就会解出不同结果
-    # （实测合并后 place_shelf 的抓取段从第 29 帧起与 pick_cube 分叉，
-    #   导致方块没被抬起）。显式设定位姿后两处结果完全一致。
+    # 第 0 帧显式从 ik_cube_above / ik_cube_touch 起算，避免依赖初值池
     set_arm_qpos(ik_cube_above)
     s2 = cartesian_segment(CUBE_ABOVE, CUBE_POS, MAT, n2, GRIPPER_OPEN,
-                           "cube_approach", scale=scale)
+                           "cube_approach", scale=scale, first_seed=ik_cube_above)
 
     s3 = hold_segment(ik_cube_touch, 3, GRIPPER_CLOSED, scale=scale)
 
     n4 = frames_for_steps(joint_delta(ik_cube_touch, ik_cube_lift), min_frames=6)
     set_arm_qpos(ik_cube_touch)
     s4 = cartesian_segment(CUBE_POS, CUBE_LIFT, MAT, n4, GRIPPER_CLOSED,
-                           "cube_lift", scale=scale)
+                           "cube_lift", scale=scale, first_seed=ik_cube_touch)
 
     if keep_holding:
         # 停在抬起位姿，交给放置流程
@@ -770,23 +793,22 @@ SHELF_ABOVE = [SHELF_SURFACE[0], SHELF_SURFACE[1], 0.25]
 
 
 def build_place_shelf(scale=1.0):
-    # 说明：尝试过让 place_shelf 复用 pick_cube 生成的抓取分段（含复用同一组
-    # 分段对象），但实测抓取段从第 29 帧起与 pick_cube 分叉、方块不再被抬起。
-    # 根因是 IK 的 warm_start 链条使同一次生成的结果依赖于调用前的手臂残留状态
-    # （非可复现）。在查清并消除该非确定性之前，这里保持**自包含**生成，
-    # 不复用，以免引入隐蔽回归。
+    # 抓取部分**自包含**生成（不复用 build_pick_segments）。
+    # 曾尝试复用：即使两个任务的关键帧与初值池完全一致、cartesian_segment 也已
+    # 固定首帧 seed，place_shelf 的抓取段仍从第 34 帧起与 pick_cube 分叉。
+    # 说明还存在一个未定位的状态依赖；在查清之前不复用，以免引入隐蔽回归。
     k1 = joint_segment(home_qpos, ik_cube_above,
                        frames_for_steps(joint_delta(home_qpos, ik_cube_above)),
                        GRIPPER_OPEN, scale=scale)
     n_k2 = frames_for_steps(joint_delta(ik_cube_above, ik_cube_touch), min_frames=6)
-    set_arm_qpos(ik_cube_above)
     k2 = cartesian_segment(CUBE_ABOVE, CUBE_POS, MAT, n_k2, GRIPPER_OPEN,
-                           "place_cube_approach", scale=scale)
+                           "place_cube_approach", scale=scale,
+                           first_seed=ik_cube_above)
     k3 = hold_segment(ik_cube_touch, 3, GRIPPER_CLOSED, scale=scale)
     n_k4 = frames_for_steps(joint_delta(ik_cube_touch, ik_cube_lift), min_frames=6)
-    set_arm_qpos(ik_cube_touch)
     k4 = cartesian_segment(CUBE_POS, CUBE_LIFT, MAT, n_k4, GRIPPER_CLOSED,
-                           "place_cube_lift", scale=scale)
+                           "place_cube_lift", scale=scale,
+                           first_seed=ik_cube_touch)
     pick = [k1, k2, k3, k4]
 
     k5 = joint_segment(ik_cube_lift, ik_shelf_above,
@@ -795,12 +817,12 @@ def build_place_shelf(scale=1.0):
     n_k6 = frames_for_steps(joint_delta(ik_shelf_above, ik_shelf), min_frames=6)
     set_arm_qpos(ik_shelf_above)
     k6 = cartesian_segment(SHELF_ABOVE, SHELF_SURFACE, MAT, n_k6, GRIPPER_CLOSED,
-                           "shelf_approach", scale=scale)
+                           "shelf_approach", scale=scale, first_seed=ik_shelf_above)
     k7 = hold_segment(ik_shelf, 3, GRIPPER_OPEN, scale=scale)
     n_k8 = frames_for_steps(joint_delta(ik_shelf, ik_shelf_above), min_frames=6)
     set_arm_qpos(ik_shelf)
     k8 = cartesian_segment(SHELF_SURFACE, SHELF_ABOVE, MAT, n_k8, GRIPPER_OPEN,
-                           "shelf_retract", scale=scale)
+                           "shelf_retract", scale=scale, first_seed=ik_shelf)
     k9 = joint_segment(ik_shelf_above, ik_cube_above,
                        frames_for_steps(joint_delta(ik_shelf_above, ik_cube_above)),
                        GRIPPER_OPEN, scale=scale)
