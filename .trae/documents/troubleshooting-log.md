@@ -72,56 +72,14 @@
 | **解决** | 锁定 React 18：`npm install react@18 react-dom@18` |
 | **教训** | R3F v8 只支持 React 18，不要升级到 React 19 |
 
-### F2. 拖拽 getBoundingClientRect 报错
+### F2. 无物理引擎导致无法交互
 
 | 项 | 内容 |
 |---|------|
-| **时间** | 4-DOF 机械臂开发 |
-| **问题** | 拖拽小球时控制台报 `event.target.getBoundingClientRect is not a function` |
-| **原因** | R3F 中 `event.target` 是 Three.js Object3D（不是 DOM 元素），没有 DOM API |
-| **解决** | 用 `gl.domElement`（canvas 元素）替代 `event.target`，调用 `getBoundingClientRect`、`setPointerCapture`、`releasePointerCapture` |
-| **文件** | [RobotArm.tsx](file:///e:/robot-policy-playground/frontend/src/components/RobotArm.tsx) |
-| **教训** | R3F 事件对象的 target 不是 DOM 元素，需要通过 `useThree()` 获取 `gl.domElement` |
-
-### F3. IK 拖拽手柄不能作为交互对象
-
-| 项 | 内容 |
-|---|------|
-| **时间** | 4-DOF 机械臂开发 |
-| **问题** | 绿色 TargetPoint（IK 拖拽手柄）被当作"小球"，但它跟随机械臂末端，不是独立物体 |
-| **原因** | 场景中没有独立的球 mesh，TargetPoint 同时承担了拖拽手柄和操作目标两个角色 |
-| **解决** | 添加独立的小球 mesh（固定位置 `BALL_POSITION`），与 TargetPoint 分离 |
-| **教训** | IK 拖拽手柄和交互对象必须是不同的 mesh |
-
-### F4. 正运动学未包含底座旋转
-
-| 项 | 内容 |
-|---|------|
-| **时间** | 4-DOF 机械臂开发 |
-| **问题** | 机械臂与小球在相反方向，末端位置计算错误 |
-| **原因** | `forwardKinematics(j1, j2)` 只计算底座局部坐标，没有乘 j0 底座 Y 轴旋转矩阵 |
-| **解决** | 新增 `forwardKinematicsWorld(j0, j1, j2)` 包含底座旋转：`worldX = localX * cos(j0)`、`worldZ = -localX * sin(j0)` |
-| **文件** | [RobotArm.tsx](file:///e:/robot-policy-playground/frontend/src/components/RobotArm.tsx) |
-| **教训** | 多关节 FK 需要从底座到末端逐级累积变换 |
-
-### F5. 预计算角度过高
-
-| 项 | 内容 |
-|---|------|
-| **时间** | 4-DOF 机械臂开发 |
-| **问题** | 机械臂末端远离地面目标，无法接触小球 |
-| **原因** | 预计算 j1 最大 0.75 rad（~43°），末端 y ≈ 1.7m，远高于地面（y ≈ 0.08） |
-| **解决** | 调整 j1 为负值（-1.08 至 -1.5 rad），使末端接近地面 |
-| **教训** | 预计算轨迹需验证末端可达性 |
-
-### F6. 无物理引擎导致无法交互
-
-| 项 | 内容 |
-|---|------|
-| **时间** | 4-DOF 机械臂开发 |
+| **时间** | 早期手动 R3F 几何体阶段（已废弃） |
 | **问题** | 机械臂穿过球，球不移动；夹爪只改间距，无法抓取 |
-| **原因** | R3F 手动几何体无物理碰撞检测，小球是静态 mesh |
-| **解决** | 决定集成 mujoco-react（MuJoCo 物理引擎 + Franka Panda 7-DOF） |
+| **原因** | R3F 手动几何体无物理碰撞检测 |
+| **解决** | 集成 mujoco-react（MuJoCo 物理引擎 + Franka Panda 7-DOF），手动 R3F 几何体已全部移除 |
 | **教训** | 手动 R3F 几何体 + FK/IK 无法实现物理交互，需要物理引擎 |
 
 ---
@@ -283,3 +241,87 @@
 - `ERR_QUIC_PROTOCOL_ERROR 200` 是 deceptive 错误：HTTP 状态 200 但传输层失败
 - MuJoCo mesh 文件总量大（30-40MB），不适合慢速网络一次性加载
 - 应考虑 mesh 文件压缩或懒加载策略
+
+---
+
+## 阶段 8: MuJoCo 场景与相机控制修复 (2026-10-09)
+
+### 问题 19: 地面竖直渲染
+
+| 项 | 内容 |
+|---|------|
+| **时间** | 2026-10-09 |
+| **问题** | 地面在 3D 场景中始终竖直，无法水平显示 |
+| **原因** | mujoco-react 不做 Z-up→Y-up 坐标转换，源码 `index.js:575` 直接映射 `data.xpos` 到 `ref.position` |
+| **解决** | 设置 `camera.up.set(0, 0, 1)` 使 three.js 使用 Z 轴向上，匹配 MuJoCo Z-up 坐标系 |
+| **文件** | [RobotArm.tsx](file:///e:/robot-policy-playground/frontend/src/components/RobotArm.tsx) |
+| **教训** | mujoco-react 不自动转换坐标系，需手动设置相机 up 向量 |
+
+### 问题 20: 右键拖拽触发浏览器导航
+
+| 项 | 内容 |
+|---|------|
+| **时间** | 2026-10-09 |
+| **问题** | 右键拖拽旋转视角时触发浏览器返回/上下文菜单 |
+| **原因** | OrbitControls 右键按钮触发浏览器默认行为 |
+| **解决** | 设置 `mouseButtons.RIGHT = undefined` + `mouseButtons.LEFT = undefined`（避免与 IK 手柄冲突），改用 WASD 键盘控制视角（球坐标操作） |
+| **文件** | [RobotArm.tsx](file:///e:/robot-policy-playground/frontend/src/components/RobotArm.tsx) |
+| **教训** | 鼠标拖拽与 IK 交互冲突，键盘控制更可靠 |
+
+### 问题 21: ort-wasm 超出 25 MiB 部署限制
+
+| 项 | 内容 |
+|---|------|
+| **时间** | 2026-10-09 |
+| **问题** | `ort-wasm-simd-threaded.asyncify-CxOG5pUO.wasm` (25.6 MiB) 超出 Cloudflare 单文件 25 MiB 限制 |
+| **原因** | `@huggingface/transformers` (SmolVLM) 依赖 ONNX Runtime，其 WASM 文件过大 |
+| **解决** | 1. 移除 `@huggingface/transformers` 依赖 + SmolVLMTester 组件 2. build 脚本排除 .wasm 文件 |
+| **文件** | [package.json](file:///e:/robot-policy-playground/frontend/package.json) |
+| **教训** | ONNX WASM 无法部署到 Cloudflare Workers 免费计划，浏览器端 VLM 不适合本架构 |
+
+---
+
+## 阶段 9: IK 轨迹与 WSL 迁移 (2026-10-10)
+
+### 问题 22: 机械臂回放时未接触物体
+
+| 项 | 内容 |
+|---|------|
+| **时间** | 2026-10-10 |
+| **问题** | 发送指令后机械臂始终未接触方块与小球 |
+| **原因** | 旧的 `generate_panda_actions.py` 使用手动猜测的关节角度，无 FK/IK 验证 |
+| **解决** | 创建 `generate_ik_actions.py`，使用 MuJoCo Python 绑定的 Jacobian DLS IK 求解器离线计算关键帧 |
+| **文件** | [generate_ik_actions.py](file:///e:/robot-policy-playground/scripts/generate_ik_actions.py) |
+| **教训** | 预计算轨迹必须通过 IK/FK 验证，不能靠手动猜测 |
+
+### 问题 23: 3-DOF IK 朝向不受控导致抓取失败
+
+| 项 | 内容 |
+|---|------|
+| **时间** | 2026-10-10 |
+| **问题** | "place the cube on the shelf" 指令机械臂未正确抓取方块 |
+| **原因** | 3-DOF 位置 IK 不控制夹爪朝向，夹爪可能侧向接近方块；关节空间插值导致 TCP 走弧线 |
+| **解决** | 1. 升级为 6-DOF IK（`mj_jacSite` 同时计算 `jacp` + `jacr`，朝向目标=home 朝向） 2. 添加笛卡尔空间直线插值（`cartesian_segment` 逐帧 IK 求解） 3. 分段轨迹：关节空间移动 + 笛卡尔直线接近/撤离 |
+| **文件** | [generate_ik_actions.py](file:///e:/robot-policy-playground/scripts/generate_ik_actions.py) |
+| **教训** | 抓取任务需要 6-DOF IK 保证夹爪朝向；接近/撤离阶段必须用笛卡尔空间直线插值 |
+
+### 问题 24: 沙箱限制 → WSL 迁移
+
+| 项 | 内容 |
+|---|------|
+| **时间** | 2026-10-10 |
+| **问题** | Trae 沙箱阻止 Python 脚本访问 site-packages 和 `~/.wrangler` 目录 |
+| **原因** | 沙箱文件系统限制，无法运行 MuJoCo Python 绑定和 wrangler 部署 |
+| **解决** | 方案 A：项目保留 E 盘，所有终端操作在 WSL Ubuntu 中执行，node_modules 和 Python 依赖在 WSL 中安装，Windows 端仅编辑文件 |
+| **教训** | WSL 迁移后 Windows 端依赖冗余需清理；node_modules 和 Python 包是平台特定的 |
+
+### 问题 25: Home 位姿不一致
+
+| 项 | 内容 |
+|---|------|
+| **时间** | 2026-10-10 |
+| **问题** | 前端 HOME_POSE 与 MuJoCo keyframe 0 不一致，回放结束时机械臂不在正确位置 |
+| **原因** | HOME_POSE 使用旧值 `[1.707, -1.754, ...]`，IK 脚本使用 keyframe 0 `[0, 0, 0, -1.5708, ...]` |
+| **解决** | 统一 HOME_POSE 为 MuJoCo keyframe 0 值：`[0, 0, 0, -1.5708, 0, 1.5708, -0.7854, 0.5]` |
+| **文件** | [RobotArm.tsx](file:///e:/robot-policy-playground/frontend/src/components/RobotArm.tsx) |
+| **教训** | 前端初始位姿必须与 MuJoCo keyframe 一致 |
