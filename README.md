@@ -70,8 +70,12 @@ cd frontend && npm run dev     # http://localhost:5173
 
 ```bash
 cd /mnt/e/robot-policy-playground/frontend && npm run build   # 产物复制到 ../public
-cd /mnt/e/robot-policy-playground && npx wrangler deploy
+cd /mnt/e/robot-policy-playground && pywrangler deploy
 ```
+
+用 `pywrangler deploy` 而不是 `npx wrangler deploy`：`pywrangler` 是 Cloudflare 的
+Python Workers CLI，它会在部署前自动执行 `sync`，把 `pyproject.toml` 里的依赖装进
+`src/vendor/`（该目录是构建产物，已加入 `.gitignore`）。直接 `wrangler deploy` 不会做这一步。
 
 `npm run build` 的第三段是 [scripts/sync-public.mjs](scripts/sync-public.mjs)：同步产物到
 `public/`，并对全部静态文件做 **25 MiB 单文件上限校验**（免费计划硬限制）。
