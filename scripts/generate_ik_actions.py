@@ -139,6 +139,48 @@ def mat_to_quat(mat):
     mujoco.mju_mat2Quat(quat, np.asarray(mat, dtype=np.float64).flatten())
     return quat
 
+
+# ── 抓取姿态度量 ──
+left_finger_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_finger")
+right_finger_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_finger")
+
+
+def tool_tilt_deg():
+    """TCP 的 Z 轴与"竖直向下"的夹角（度）。0° = 夹爪严格朝下。"""
+    mujoco.mj_forward(model, data)
+    z = data.site_xmat[tcp_id * 9: tcp_id * 9 + 9].reshape(3, 3)[:, 2]
+    return float(np.degrees(np.arccos(np.clip(-z[2], -1.0, 1.0))))
+
+
+def finger_height_gap_mm():
+    """两指的高度差（mm）。差得越多，越夹不住矮物体。"""
+    mujoco.mj_forward(model, data)
+    if left_finger_bid < 0 or right_finger_bid < 0:
+        return -1.0
+    return abs(float(data.xpos[left_finger_bid][2] - data.xpos[right_finger_bid][2])) * 1000.0
+
+
+def report_grasp_quality(traj, label=""):
+    """报告抓取帧的夹爪姿态质量 —— 这是"能不能夹住"的硬指标。
+
+    倾斜角 0° 表示夹爪严格竖直。倾斜越大，两指越是一高一低，
+    对**矮**物体就越夹不住：倾斜约 32° 时两指高度差约 19mm，
+    而原来的 5cm 立方体半高只有 25mm → 两指无法同时贴住侧面。
+    """
+    close_idx = next((i for i, r in enumerate(traj) if r[7] < 0.5), None)
+    if close_idx is None:
+        return
+    set_arm_qpos(traj[close_idx][:7])
+    tilt = tool_tilt_deg()
+    gap = finger_height_gap_mm()
+    tcp = get_tcp_pos()
+    height_mm = 2.0 * CUBE_HALF_Z * 1000.0
+    ok = gap >= 0 and gap < height_mm * 0.5
+    status = "✓" if ok else "✗ 两指差相对物体过高，可能夹不住"
+    print(f"    [抓取质量 {label}] 闭合帧={close_idx} 倾斜={tilt:.1f}° "
+          f"两指高度差={gap:.1f}mm（物体高 {height_mm:.0f}mm）"
+          f" TCP=({tcp[0]:.3f},{tcp[1]:.3f},{tcp[2]:.3f}) {status}")
+
 # ── DLS IK 求解器（两阶段 + 步长限制 + 逐帧雅可比限幅）──
 def solve_ik(target_pos, target_mat=None, max_iter=500, damping=0.1, tol=1e-4,
              warm_start=None):
@@ -446,6 +488,7 @@ def save_segments(task_id, instruction, segments, bridge_gripper=None):
     print(f"    [平滑] 迭代后最大 |Δq|={worst:.4f} rad "
           f"({worst / FRAME_DT:.2f} rad/s)，共 {len(traj)} 帧")
     trace_velocity(traj, task_id)
+    report_grasp_quality(traj, task_id)
 
     payload = {"i": instruction, "ja": traj, "d": DURATION, "fc": len(traj)}
     path = os.path.join(OUT_DIR, f"{task_id}.json")
@@ -481,11 +524,46 @@ home_tcp_mat = data.site_xmat[tcp_id * 9:tcp_id * 9 + 9].copy().reshape(3, 3)
 print(f"\nHome TCP 位置: [{home_tcp[0]:.3f}, {home_tcp[1]:.3f}, {home_tcp[2]:.3f}]")
 print(f"Home arm qpos: {home_qpos}")
 
-# 场景中物体位置
-BALL_POS = [0.5, 0.0, 0.04]      # 小球
-CUBE_POS = [0.5, 0.3, 0.025]     # 立方体中心
-SHELF_SURFACE = [0.0, 0.5, 0.405]  # 货架顶面（shelf_top z=0.4 + half 0.0025 + margin）
-GRASP_ABOVE_Z = 0.15              # 接近高度（物体上方）
+# 场景中物体位置（抓取/放置几何**直接由 MuJoCo 模型读出**，避免与 scene.xml 不同步）
+def _body_free_joint_qpos(body_name):
+    """取 free body 的 qpos 起始地址；该 body 必须有 freejoint。"""
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    if bid < 0:
+        raise RuntimeError(f"未找到 body: {body_name}")
+    jadr = model.body_jntadr[bid]
+    if jadr < 0:
+        raise RuntimeError(f"body {body_name} 没有关节，无法作为可操作物体")
+    return model.jnt_qposadr[jadr]
+
+
+BALL_QADR = _body_free_joint_qpos("ball")
+CUBE_QADR = _body_free_joint_qpos("cube")
+
+BALL_POS = [float(v) for v in model.qpos0[BALL_QADR:BALL_QADR + 3]]
+CUBE_CENTER0 = [float(v) for v in model.qpos0[CUBE_QADR:CUBE_QADR + 3]]
+_cube_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
+CUBE_HALF = [float(v) for v in model.geom_size[_cube_gid]]
+CUBE_HALF_Z = CUBE_HALF[2]
+
+# 抓取点 = 物体中心（TCP 打到这里）
+CUBE_POS = list(CUBE_CENTER0)
+# 预抓取高度 = 物体顶部 + 留白
+GRASP_ABOVE_Z = CUBE_CENTER0[2] + CUBE_HALF_Z + 0.05
+# 抬起高度
+CUBE_LIFT_Z = CUBE_CENTER0[2] + 0.25
+
+# 货架顶面（shelf_top 的顶面）
+_shelf_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "shelf_top")
+SHELF_TOP_Z = float(model.geom_pos[_shelf_gid][2]) + float(model.geom_size[_shelf_gid][2])
+# 放置目标：让物体**底面**落在货架顶面上（必须加上物体半高，
+# 否则物体中心会停在货架面下方/上方，放不上去）
+SHELF_SURFACE = [0.0, 0.5, SHELF_TOP_Z + CUBE_HALF_Z]
+
+print("\n物体几何（读自模型）:")
+print(f"  ball 中心={np.round(BALL_POS, 4)}")
+print(f"  cube 中心={np.round(CUBE_POS, 4)} 半高={CUBE_HALF_Z:.4f}")
+print(f"    抓取点 z={CUBE_POS[2]:.4f}  预抓取 z={GRASP_ABOVE_Z:.4f}  抬起 z={CUBE_LIFT_Z:.4f}")
+print(f"    货架顶面 z={SHELF_TOP_Z:.4f}  放置目标(TCP) z={SHELF_SURFACE[2]:.4f}")
 
 # 预计算各目标的 IK（6-DOF：位置 + 朝向，朝向=home 向下）
 print("\n计算 IK 关键帧（6-DOF）...")
@@ -534,7 +612,7 @@ ik_cube_touch = solve_ik(CUBE_POS, MAT, warm_start=ik_cube_above)
 verify_tcp("cube_touch")
 
 print("  抬起立方体:")
-ik_cube_lift = solve_ik([CUBE_POS[0], CUBE_POS[1], 0.3], MAT, warm_start=ik_cube_touch)
+ik_cube_lift = solve_ik([CUBE_POS[0], CUBE_POS[1], CUBE_LIFT_Z], MAT, warm_start=ik_cube_touch)
 verify_tcp("cube_lift")
 
 # 货架
@@ -575,7 +653,7 @@ save_task("push_forward_001", "push ball forward", [
 # 任务 3: pick up the cube（关节空间移动 + 笛卡尔直线接近/撤离）
 # 各段帧数按"关节变化量 ÷ 速度上限"自动计算，不再写死 8 帧。
 CUBE_ABOVE = [CUBE_POS[0], CUBE_POS[1], GRASP_ABOVE_Z]
-CUBE_LIFT = [CUBE_POS[0], CUBE_POS[1], 0.3]
+CUBE_LIFT = [CUBE_POS[0], CUBE_POS[1], CUBE_LIFT_Z]
 
 n_s1 = frames_for_steps(joint_delta(home_qpos, ik_cube_above))
 seg1 = joint_segment(home_qpos, ik_cube_above, n_s1, GRIPPER_OPEN)
