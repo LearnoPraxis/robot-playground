@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node ../scripts/sync-public.mjs",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -b && vite build && node ../scripts/sync-public.mjs",
     "lint": "oxlint",
     "preview": "vite preview"
   },
