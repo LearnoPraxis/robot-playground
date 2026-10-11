@@ -2,12 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { RobotArm, HOME_POSE, type PandaJointAngles, type RobotMode } from "./components/RobotArm";
 import { ControlPanel } from "./components/ControlPanel";
 import { useWebSocket } from "./hooks/useWebSocket";
-import SmolVLMTester from "./components/SmolVLMTester";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api";
 const WS_URL = import.meta.env.VITE_WS_URL ?? "/ws/stream";
-
-type Tab = "robot" | "smolvlm";
 
 export default function App() {
   const [loading, setLoading] = useState(false);
@@ -15,9 +12,9 @@ export default function App() {
   const [jointAngles, setJointAngles] = useState<PandaJointAngles>(HOME_POSE);
   const [displayPlaying, setDisplayPlaying] = useState(true);
   const [mode, setMode] = useState<RobotMode>("interactive");
-  const [activeTab, setActiveTab] = useState<Tab>("robot");
   const [localPlayback, setLocalPlayback] = useState(false);
   const [localIndex, setLocalIndex] = useState(0);
+  const [resetCounter, setResetCounter] = useState(0);
   const playbackTimerRef = useRef<number | null>(null);
 
   const { state, connect, sendTaskId, reset } = useWebSocket(WS_URL);
@@ -92,6 +89,7 @@ export default function App() {
       !localPlayback
     ) {
       setMode("interactive");
+      setJointAngles(HOME_POSE);
     }
   }, [mode, state.frameCount, state.currentFrame, state.isPlaying, localPlayback]);
 
@@ -143,6 +141,15 @@ export default function App() {
     setLocalIndex(0);
   };
 
+  /** 重置 MuJoCo 场景（关节 + 物体位置） */
+  const handleResetRobot = () => {
+    setResetCounter((c) => c + 1);
+    setJointAngles(HOME_POSE);
+    setMode("interactive");
+    setLocalPlayback(false);
+    setLocalIndex(0);
+  };
+
   return (
     <div
       style={{
@@ -166,49 +173,15 @@ export default function App() {
         <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>
           Robot Policy Playground
         </h1>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button
-            onClick={() => setActiveTab("robot")}
-            style={{
-              padding: "6px 14px",
-              borderRadius: 4,
-              border: "1px solid #334155",
-              background: activeTab === "robot" ? "#1e40af" : "transparent",
-              color: "#e2e8f0",
-              cursor: "pointer",
-              fontSize: 13,
-            }}
-          >
-            机械臂演示
-          </button>
-          <button
-            onClick={() => setActiveTab("smolvlm")}
-            style={{
-              padding: "6px 14px",
-              borderRadius: 4,
-              border: "1px solid #334155",
-              background: activeTab === "smolvlm" ? "#1e40af" : "transparent",
-              color: "#e2e8f0",
-              cursor: "pointer",
-              fontSize: 13,
-            }}
-          >
-            SmolVLM 验证
-          </button>
-        </div>
       </header>
 
-      {activeTab === "smolvlm" ? (
-        <div style={{ flex: 1, overflowY: "auto" }}>
-          <SmolVLMTester />
-        </div>
-      ) : (
       <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
         <div style={{ flex: 1, position: "relative" }}>
           <RobotArm
             jointAngles={jointAngles}
             onJointAnglesChange={setJointAngles}
             mode={mode}
+            resetSignal={resetCounter}
           />
         </div>
 
@@ -229,11 +202,11 @@ export default function App() {
             error={state.error ?? apiError}
             onPlayPause={handlePlayPause}
             onReset={handleReset}
+            onResetRobot={handleResetRobot}
             loading={loading}
           />
         </aside>
       </div>
-      )}
 
       <footer
         style={{

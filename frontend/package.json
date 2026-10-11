@@ -5,12 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node -e \"const fs=require('fs'),path=require('path');const dest='../public';fs.copyFileSync('dist/index.html',path.join(dest,'index.html'));const da=path.join(dest,'assets');if(!fs.existsSync(da))fs.mkdirSync(da,{recursive:true});fs.readdirSync(da).filter(f=>f.endsWith('.wasm')).forEach(f=>{fs.unlinkSync(path.join(da,f));console.log('removed:'+f)});fs.readdirSync('dist/assets').filter(f=>!f.endsWith('.wasm')).forEach(f=>{fs.copyFileSync(path.join('dist/assets',f),path.join(da,f));console.log('copied:'+f)});console.log('Build copy done (wasm excluded)');\"",
     "lint": "oxlint",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.3.0",
     "@react-three/drei": "^9.99.0",
     "@react-three/fiber": "^8.15.19",
     "mujoco-react": "^8.2.1",

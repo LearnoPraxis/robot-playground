@@ -18,6 +18,7 @@ interface ControlPanelProps {
   error: string | null;
   onPlayPause: () => void;
   onReset: () => void;
+  onResetRobot: () => void;
   loading: boolean;
 }
 
@@ -39,6 +40,7 @@ export function ControlPanel({
   error,
   onPlayPause,
   onReset,
+  onResetRobot,
   loading,
 }: ControlPanelProps) {
   const [instruction, setInstruction] = useState("");
@@ -156,6 +158,12 @@ export function ControlPanel({
           style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid #334155", background: "#1e293b", color: "#e2e8f0", cursor: "pointer" }}
         >
           重置
+        </button>
+        <button
+          onClick={onResetRobot}
+          style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid #334155", background: "#1e293b", color: "#e2e8f0", cursor: "pointer" }}
+        >
+          重置机械臂
         </button>
       </div>
     </div>
