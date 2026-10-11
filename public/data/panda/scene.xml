@@ -29,15 +29,21 @@
          - 高度 10cm 是为了容忍夹爪倾斜带来的两指高度差（约 3.8cm）。 -->
     <body name="cube" pos="0.5 0.22 0.05">
       <freejoint/>
-      <geom name="cube_geom" type="box" size="0.0175 0.0175 0.05" rgba="0.8 0.4 0.2 1" mass="0.05"/>
+      <geom name="cube_geom" type="box" size="0.0175 0.0175 0.05" rgba="0.8 0.4 0.2 1" mass="0.05"
+            friction="1.0 0.005 0.0001"/>
     </body>
-    <!-- 货架（static body，放置目标） -->
+    <!-- 货架（static body，放置目标）
+         2026-10-11：整体抬高。原因：原来顶面在 z=0.4、四条腿只到 0.4，
+         平台**下面几乎没有净空**，放置时手臂/物体在接近途中会先撞到平台，
+         表现为"每次都想把方块放到架子下方"。现在顶面 0.55 m，
+         腿高 0.55 m，平台下方有 55cm 净空，放置路径不再被挡。
+         物体高 10cm → 放到架上后中心 0.60 m、顶面 0.65 m。 -->
     <body name="shelf" pos="0 0.5 0">
-      <geom name="shelf_top" type="box" size="0.15 0.15 0.005" pos="0 0 0.4" rgba="0.3 0.3 0.3 1"/>
-      <geom name="shelf_leg1" type="box" size="0.01 0.01 0.2" pos="0.14 0.14 0.2" rgba="0.2 0.2 0.2 1"/>
-      <geom name="shelf_leg2" type="box" size="0.01 0.01 0.2" pos="-0.14 0.14 0.2" rgba="0.2 0.2 0.2 1"/>
-      <geom name="shelf_leg3" type="box" size="0.01 0.01 0.2" pos="0.14 -0.14 0.2" rgba="0.2 0.2 0.2 1"/>
-      <geom name="shelf_leg4" type="box" size="0.01 0.01 0.2" pos="-0.14 -0.14 0.2" rgba="0.2 0.2 0.2 1"/>
+      <geom name="shelf_top" type="box" size="0.15 0.15 0.005" pos="0 0 0.55" rgba="0.3 0.3 0.3 1"/>
+      <geom name="shelf_leg1" type="box" size="0.01 0.01 0.275" pos="0.14 0.14 0.275" rgba="0.2 0.2 0.2 1"/>
+      <geom name="shelf_leg2" type="box" size="0.01 0.01 0.275" pos="-0.14 0.14 0.275" rgba="0.2 0.2 0.2 1"/>
+      <geom name="shelf_leg3" type="box" size="0.01 0.01 0.275" pos="0.14 -0.14 0.275" rgba="0.2 0.2 0.2 1"/>
+      <geom name="shelf_leg4" type="box" size="0.01 0.01 0.275" pos="-0.14 -0.14 0.275" rgba="0.2 0.2 0.2 1"/>
     </body>
   </worldbody>
 </mujoco>

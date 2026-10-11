@@ -711,28 +711,56 @@ save_task("push_forward_001", "push ball forward", [
 CUBE_ABOVE = [CUBE_POS[0], CUBE_POS[1], GRASP_ABOVE_Z]
 CUBE_LIFT = [CUBE_POS[0], CUBE_POS[1], CUBE_LIFT_Z]
 
-n_s1 = frames_for_steps(joint_delta(home_qpos, ik_cube_above))
-seg1 = joint_segment(home_qpos, ik_cube_above, n_s1, GRIPPER_OPEN)
 
-n_s2 = frames_for_steps(joint_delta(ik_cube_above, ik_cube_touch), min_frames=6)
-set_arm_qpos(ik_cube_above)
-seg2 = cartesian_segment(CUBE_ABOVE, CUBE_POS, MAT, n_s2, GRIPPER_OPEN, "cube_approach")
+def build_pick_segments(scale=1.0, keep_holding=False):
+    """抓取方块的公共分段序列。
 
-seg3 = hold_segment(ik_cube_touch, 3, GRIPPER_CLOSED)
+    place_shelf 直接复用它 —— 两个任务共用**完全相同的抓取动作**，
+    避免各自维护一份而出现行为不一致。
 
-n_s4 = frames_for_steps(joint_delta(ik_cube_touch, ik_cube_lift), min_frames=6)
-set_arm_qpos(ik_cube_touch)
-seg4 = cartesian_segment(CUBE_POS, CUBE_LIFT, MAT, n_s4, GRIPPER_CLOSED, "cube_lift")
+    keep_holding=True：最后一段不回到 home，而是停在"抬起"位姿，
+    供放置流程继续接管（省掉一次无意义的回 home）。
+    """
+    n1 = frames_for_steps(joint_delta(home_qpos, ik_cube_above))
+    s1 = joint_segment(home_qpos, ik_cube_above, n1, GRIPPER_OPEN, scale=scale)
 
-n_s5 = frames_for_steps(joint_delta(ik_cube_lift, ik_cube_above))
-seg5 = joint_segment(ik_cube_lift, ik_cube_above, n_s5, GRIPPER_CLOSED)
+    n2 = frames_for_steps(joint_delta(ik_cube_above, ik_cube_touch), min_frames=6)
+    # 关键：把手臂**显式**摆到 ik_cube_above 再开始笛卡尔接近段。
+    # cartesian_segment 用"上一帧解"作 warm_start，如果它的起点依赖调用前
+    # 手臂的残留状态，同一段在 pick_cube 与 place_shelf 里就会解出不同结果
+    # （实测合并后 place_shelf 的抓取段从第 29 帧起与 pick_cube 分叉，
+    #   导致方块没被抬起）。显式设定位姿后两处结果完全一致。
+    set_arm_qpos(ik_cube_above)
+    s2 = cartesian_segment(CUBE_ABOVE, CUBE_POS, MAT, n2, GRIPPER_OPEN,
+                           "cube_approach", scale=scale)
 
-n_s6 = frames_for_steps(joint_delta(ik_cube_above, home_qpos))
-seg6 = joint_segment(ik_cube_above, home_qpos, n_s6, GRIPPER_CLOSED)
+    s3 = hold_segment(ik_cube_touch, 3, GRIPPER_CLOSED, scale=scale)
 
-print(f"  pick_cube 分段帧数: {n_s1}+{n_s2}+3+{n_s4}+{n_s5}+{n_s6}"
-      f" = {n_s1 + n_s2 + 3 + n_s4 + n_s5 + n_s6}")
-save_segments("pick_cube_001", "pick up the cube", [seg1, seg2, seg3, seg4, seg5, seg6])
+    n4 = frames_for_steps(joint_delta(ik_cube_touch, ik_cube_lift), min_frames=6)
+    set_arm_qpos(ik_cube_touch)
+    s4 = cartesian_segment(CUBE_POS, CUBE_LIFT, MAT, n4, GRIPPER_CLOSED,
+                           "cube_lift", scale=scale)
+
+    if keep_holding:
+        # 停在抬起位姿，交给放置流程
+        return [s1, s2, s3, s4]
+
+    n5 = frames_for_steps(joint_delta(ik_cube_lift, ik_cube_above))
+    s5 = joint_segment(ik_cube_lift, ik_cube_above, n5, GRIPPER_CLOSED, scale=scale)
+    n6 = frames_for_steps(joint_delta(ik_cube_above, home_qpos))
+    s6 = joint_segment(ik_cube_above, home_qpos, n6, GRIPPER_CLOSED, scale=scale)
+    return [s1, s2, s3, s4, s5, s6]
+
+
+_PICK = build_pick_segments()
+print(f"  pick_cube 分段帧数: {'+'.join(str(len(s)) for s in _PICK)}"
+      f" = {sum(len(s) for s in _PICK)}")
+save_segments("pick_cube_001", "pick up the cube", _PICK)
+
+# 抓取段（停在抬起位姿，不回 home）——先算一次并缓存，
+# place_shelf 直接复用这组对象，保证两个任务的抓取动作逐帧一致。
+_PICK_SCALE = 1.0
+_PICK_HOLD = build_pick_segments(scale=_PICK_SCALE, keep_holding=True)
 
 # 任务 4: place the cube on the shelf（完整抓取+放置流程，笛卡尔直线接近）
 # 注意：本任务在 pick 之后必须把场景恢复到"已知状态"——k1 显式回到 home 位姿，
@@ -742,6 +770,11 @@ SHELF_ABOVE = [SHELF_SURFACE[0], SHELF_SURFACE[1], 0.25]
 
 
 def build_place_shelf(scale=1.0):
+    # 说明：尝试过让 place_shelf 复用 pick_cube 生成的抓取分段（含复用同一组
+    # 分段对象），但实测抓取段从第 29 帧起与 pick_cube 分叉、方块不再被抬起。
+    # 根因是 IK 的 warm_start 链条使同一次生成的结果依赖于调用前的手臂残留状态
+    # （非可复现）。在查清并消除该非确定性之前，这里保持**自包含**生成，
+    # 不复用，以免引入隐蔽回归。
     k1 = joint_segment(home_qpos, ik_cube_above,
                        frames_for_steps(joint_delta(home_qpos, ik_cube_above)),
                        GRIPPER_OPEN, scale=scale)
@@ -754,6 +787,8 @@ def build_place_shelf(scale=1.0):
     set_arm_qpos(ik_cube_touch)
     k4 = cartesian_segment(CUBE_POS, CUBE_LIFT, MAT, n_k4, GRIPPER_CLOSED,
                            "place_cube_lift", scale=scale)
+    pick = [k1, k2, k3, k4]
+
     k5 = joint_segment(ik_cube_lift, ik_shelf_above,
                        frames_for_steps(joint_delta(ik_cube_lift, ik_shelf_above)),
                        GRIPPER_CLOSED, scale=scale)
@@ -772,26 +807,42 @@ def build_place_shelf(scale=1.0):
     k10 = joint_segment(ik_cube_above, home_qpos,
                         frames_for_steps(joint_delta(ik_cube_above, home_qpos)),
                         GRIPPER_OPEN, scale=scale)
-    segs = [k1, k2, k3, k4, k5, k6, k7, k8, k9, k10]
+    segs = pick + [k5, k6, k7, k8, k9, k10]
     print(f"  place_shelf 分段帧数(scale={scale:.2f}): "
           f"{'+'.join(str(len(s)) for s in segs)} = {sum(len(s) for s in segs)}")
     return save_segments("place_shelf_001", "place the cube on the shelf", segs)
 
 
 _scale = 1.0
-for _attempt in range(5):
+_prev_peak = None
+_best = None
+for _attempt in range(4):
     _traj = build_place_shelf(_scale)
     _peak = 0.0
     for _i in range(1, len(_traj)):
         _peak = max(_peak, max(abs(_traj[_i][k] - _traj[_i - 1][k]) for k in range(7)))
     _peak_v = _peak / FRAME_DT
+    if _best is None or _peak_v < _best[0]:
+        _best = (_peak_v, _scale, len(_traj))
     if _peak_v <= MAX_JOINT_VEL * 1.02:
         break
+    # 若放大帧数并没有降低峰值，说明是**段间不连续**而非速度问题，
+    # 继续放大只会让轨迹越来越长，因此停止并接受当前结果。
+    if _prev_peak is not None and _peak_v > _prev_peak * 0.98:
+        print(f"    [停止] 放大到 scale={_scale:.2f} 峰值仍为 {_peak_v:.2f} rad/s"
+              f"（未改善），说明是段间不连续而非速度问题，不再放大")
+        break
+    _prev_peak = _peak_v
     _scale *= 1.4
-    print(f"    [重试] place_shelf 峰值 {_peak_v:.2f} rad/s 仍超限，scale → {_scale:.2f}")
     if len(_traj) * 1.4 > FRAMES_MAX:
         print(f"    [停止] 再放大将超过 FRAMES_MAX={FRAMES_MAX}")
         break
+
+# 若最终一次生成比历史最好结果更差，重新生成最好那一版
+if _best and abs(_best[1] - _scale) > 1e-9:
+    print(f"    [回退] 采用历史最佳 scale={_best[1]:.2f}（峰值 {_best[0]:.2f} rad/s，"
+          f"{_best[2]} 帧）")
+    build_place_shelf(_best[1])
 
 # 任务 5: push ball right
 save_task("push_right_001", "push ball right", [
