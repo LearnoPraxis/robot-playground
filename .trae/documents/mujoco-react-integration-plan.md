@@ -136,6 +136,9 @@ interface RobotArmProps {
 ## 四、验证清单
 
 1. ✅ `npm run build` 后 dist/assets/ 含 .wasm（~10MB）
+   > **2026-10-11 更正**：本项描述已过时。实际构建产物中**没有**独立 `.wasm` 文件——
+   > MuJoCo 的 WASM 是**内联**在 JS chunk 里的（`dist/assets/index-*.js` 约 11.33 MiB）。
+   > 因此 `dist/assets/` 里"看不到 .wasm"是正常的，不是构建坏了。
 2. ✅ Franka Panda 模型加载无白屏
 3. ✅ interactive 模式拖拽 IkGizmo → 7-DOF 跟随
 4. ✅ 拖拽 TCP 接触小球 → 球被物理推开
@@ -144,6 +147,35 @@ interface RobotArmProps {
 7. ✅ 部署后 workers.dev 模型加载正常
 8. ⏳ pick_cube 任务夹爪先开后合 → 立方体被提起（6-DOF IK + 笛卡尔直线插值，待验证）
 9. ⏳ place_shelf 任务方块放置到货架正中间（待验证）
+
+> 以上 ✅ 表示"曾验证通过"，**不代表当前线上如此**。当前状态见下一节。
+
+## 四之二、部署与验证记录
+
+### 2026-10-11 部署（Version ID `54f4ccfa-e1d5-475a-b1db-cf460df09a63`）
+
+背景：前端 bundle **本来就是最新的**（内容哈希相同：本地重新构建得到与线上完全一致的
+`index-CL0HiSH1.js`，sha256 `8725B349…A4FE280B`）；**落后的是 5 个轨迹 JSON**。
+`wrangler deploy` 的输出可直接印证：`Found 5 new or modified static assets`——
+上传的正是 5 个轨迹文件，前端产物一个都没传（75 个已存在）。
+
+命令行验证结果（全部针对线上 `https://robot-playground.qmes743628.workers.dev`）：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 5 个轨迹 JSON + `task_index.json` 与本地 | **逐字节相同**（3473/3492/3270/3016/3184/191 B） |
+| 前端 bundle | 与本地构建 sha256 一致（未变，符合预期） |
+| `GET /api/health` | `{"status":"ok"}` |
+| `POST /api/infer` `"pick up the cube"` | `success=true, task_id=pick_cube_001` |
+| `POST /api/infer` `"pick cube"` | `success=false`（精确查表，符合设计） |
+| WebSocket `/ws/stream` 推流 | `start.fc=60`，收到 **60 帧**，`done`，每帧 **8 维** |
+| WS 首帧 / 末帧 | `[0,0,0,-1.5708,0,1.5708,-0.7853,1.0]` / `[…,0.0]`（夹爪闭合，与数据一致） |
+| WS 端到端耗时 | **3.66 s**（服务端间隔 30 ms × 60 帧 ≈ 1.8 s，实测约 2 倍） |
+
+**仍未验证（只能人工在浏览器看）**：清单第 8、9 项（6-DOF IK 是否真的夹起方块、
+是否放进货架正中），以及本地回放（流结束后点"播放"从头重放）。
+WebSocket 耗时为 3.66 s 而非 1.8 s，说明服务端 30 ms 间隔在真实链路上并不精确，
+回放观感可能比预期慢——这一点也建议人工确认。
 
 ## 五、风险
 
