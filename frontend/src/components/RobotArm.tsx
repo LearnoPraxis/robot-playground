@@ -7,12 +7,21 @@ import {
   MujocoProvider,
   MujocoCanvas,
   useMujoco,
+  useMujocoWasm,
   useIkController,
   IkGizmo,
   useCtrl,
   useBeforePhysicsStep,
+  useAfterPhysicsStep,
 } from "mujoco-react";
-import type { SceneConfig } from "mujoco-react";
+import type { SceneConfig, MujocoModel } from "mujoco-react";
+import {
+  isRecording,
+  noteCommand,
+  recordPhysicsStep,
+  telemetryBindings,
+  type TelemetryBindings,
+} from "../telemetry/telemetry";
 
 /** 8-DOF：7 关节 + 1 夹爪（0=闭合，1=全开） */
 export type PandaJointAngles = [
@@ -54,10 +63,14 @@ function LoadingIndicator() {
   );
 }
 
+/** 遥测要记录的自由体 */
+const TELEMETRY_BODIES = ["ball", "cube"] as const;
+
 /** 场景内部组件 */
 function Scene({ jointAngles, mode, resetSignal }: RobotArmProps) {
   const { camera } = useThree();
   const { isPending, isReady, isError, error, api } = useMujoco();
+  const wasm = useMujocoWasm();
   const ik = useIkController({ siteName: "tcp", numJoints: 7 });
   const controlsRef = useRef<OrbitControlsImpl>(null);
 
@@ -76,6 +89,73 @@ function Scene({ jointAngles, mode, resetSignal }: RobotArmProps) {
   anglesRef.current = jointAngles;
   const modeRef = useRef(mode);
   modeRef.current = mode;
+
+  /**
+   * 解析遥测所需的模型下标（只做一次）。
+   *
+   * 用 MuJoCo 自己的 mj_name2id 而不是手写名字解析：名字表在 model.names 里是
+   * 以 null 分隔的字节串，手写解析容易在边界上出错。
+   */
+  useEffect(() => {
+    const model = api?.mjModelRef?.current as (MujocoModel & Record<string, unknown>) | undefined;
+    const mod = wasm.mujoco as unknown as
+      | { mj_name2id?: (m: unknown, t: number, n: string) => number; mju_str2Type?: (s: string) => number }
+      | null;
+    if (!isReady || !model || !mod?.mj_name2id || !mod.mju_str2Type) return;
+
+    const name2id = (name: string, type: string): number =>
+      mod.mj_name2id!(model, mod.mju_str2Type!(type), name);
+
+    const jntQposAdr = (model.jnt_qposadr ?? []) as ArrayLike<number>;
+    const armQposAdr: number[] = [];
+    for (let i = 1; i <= 7; i += 1) {
+      const id = name2id(`joint${i}`, "joint");
+      if (id >= 0) armQposAdr.push(jntQposAdr[id]);
+    }
+    const fingerQposAdr: number[] = [];
+    for (const n of ["finger_joint1", "finger_joint2"]) {
+      const id = name2id(n, "joint");
+      if (id >= 0) fingerQposAdr.push(jntQposAdr[id]);
+    }
+
+    const bodyXposAdr: Record<string, number> = {};
+    for (const n of TELEMETRY_BODIES) {
+      const id = name2id(n, "body");
+      if (id >= 0) bodyXposAdr[n] = id;
+    }
+
+    const bindings: TelemetryBindings = {
+      timestep: model.opt?.timestep ?? 0.002,
+      armQposAdr,
+      fingerQposAdr,
+      gripperCtrlAdr: name2id("actuator8", "actuator"),
+      tcpSiteAdr: name2id("tcp", "site"),
+      bodyXposAdr,
+    };
+    telemetryBindings(bindings);
+    console.info("[telemetry] bindings resolved", bindings);
+  }, [api, isReady, wasm.mujoco]);
+
+  /** 物理步进前：记录本帧下发的目标（遥测的"期望"侧）。 */
+  useBeforePhysicsStep(() => {
+    if (modeRef.current === "replay" && isRecording()) {
+      noteCommand(anglesRef.current);
+    }
+  });
+
+  /** 物理步进后：记录仿真真实状态（遥测的"实际"侧）。 */
+  useAfterPhysicsStep((model, data) => {
+    if (!isRecording()) return;
+    recordPhysicsStep({
+      time: data.time,
+      qpos: data.qpos,
+      ctrl: data.ctrl,
+      siteXpos: data.site_xpos,
+      xpos: data.xpos,
+      ncon: data.ncon ?? 0,
+      timestep: model.opt?.timestep ?? 0.002,
+    });
+  });
 
   // 设置相机 up 向量为 Z 轴，匹配 MuJoCo Z-up 坐标系
   useEffect(() => {

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { beginTelemetry, endTelemetry, isRecording as isTelemetryRecording } from "../telemetry/telemetry";
 
 export type ConnectionStatus =
   | "idle"
@@ -27,7 +28,11 @@ function resolveWsUrl(relativeUrl: string): string {
   return `${proto}//${window.location.host}${relativeUrl}`;
 }
 
-export function useWebSocket(wsRelativeUrl = "/ws/stream") {
+export function useWebSocket(
+  wsRelativeUrl = "/ws/stream",
+  /** 遥测标签：App 在发送指令时写入，用于给录制结果打上原始指令 */
+  telemetryLabel?: { current: { instruction: string; taskId: string } },
+) {
   const wsRef = useRef<WebSocket | null>(null);
   const heartbeatRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -93,6 +98,15 @@ export function useWebSocket(wsRelativeUrl = "/ws/stream") {
         const msg = JSON.parse(event.data as string);
         switch (msg.type) {
           case "start":
+            // 遥测：记录回调里读到的实际角度，需要先建立录制会话。
+            // （App 在 /api/infer 成功时已调用 beginTelemetry，这里兜底，避免漏录。）
+            if (!isTelemetryRecording()) {
+              beginTelemetry({
+                instruction: telemetryLabel?.current.instruction ?? "",
+                taskId: telemetryLabel?.current.taskId ?? "",
+                source: "ws",
+              });
+            }
             setState((s) => ({
               ...s,
               actions: [],
@@ -109,6 +123,8 @@ export function useWebSocket(wsRelativeUrl = "/ws/stream") {
             }));
             break;
           case "done":
+            // 遥测：流结束 → 再观察 1.2s 后结算，用于判断机器人是否稳定下来
+            endTelemetry();
             setState((s) => ({ ...s, isPlaying: false }));
             break;
           case "error":

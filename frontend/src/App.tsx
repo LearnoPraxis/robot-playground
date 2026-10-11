@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { RobotArm, HOME_POSE, type PandaJointAngles, type RobotMode } from "./components/RobotArm";
 import { ControlPanel } from "./components/ControlPanel";
+import { DebugPanel } from "./components/DebugPanel";
 import { useWebSocket } from "./hooks/useWebSocket";
+import { beginTelemetry, setLocalReplayActive } from "./telemetry/telemetry";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api";
 const WS_URL = import.meta.env.VITE_WS_URL ?? "/ws/stream";
@@ -16,8 +18,19 @@ export default function App() {
   const [localIndex, setLocalIndex] = useState(0);
   const [resetCounter, setResetCounter] = useState(0);
   const playbackTimerRef = useRef<number | null>(null);
+  /** 传给 useWebSocket 的遥测标签（指令已归一化，这里只想记录原始指令） */
+  const telemetryLabelRef = useRef<{ instruction: string; taskId: string }>({
+    instruction: "",
+    taskId: "",
+  });
 
-  const { state, connect, sendTaskId, reset } = useWebSocket(WS_URL);
+  const { state, connect, sendTaskId, reset } = useWebSocket(WS_URL, telemetryLabelRef);
+
+  // 本地回放期间不采样遥测（回放只是重放已存的帧，不是新的物理执行）
+  useEffect(() => {
+    setLocalReplayActive(localPlayback);
+    return () => setLocalReplayActive(false);
+  }, [localPlayback]);
 
   // 实时流：WebSocket 帧到达时应用最后一帧
   useEffect(() => {
@@ -112,6 +125,9 @@ export default function App() {
         reset();
         setJointAngles(HOME_POSE);
         setMode("replay");
+        // 遥测：记录本次指令执行期间「下发目标 vs 仿真实际」的逐帧对照
+        telemetryLabelRef.current = { instruction, taskId: data.task_id };
+        beginTelemetry({ instruction, taskId: data.task_id, source: "ws" });
         sendTaskId(data.task_id);
       } else {
         setApiError(data.message ?? "指令未匹配到已知任务");
@@ -205,6 +221,7 @@ export default function App() {
             onResetRobot={handleResetRobot}
             loading={loading}
           />
+          <DebugPanel />
         </aside>
       </div>
 
