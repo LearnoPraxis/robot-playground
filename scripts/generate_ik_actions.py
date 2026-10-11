@@ -77,11 +77,13 @@ def get_tcp_pos():
 FRAMES = 60            # 默认帧数（推球等平滑任务）
 DURATION = 2.0         # 名义时长（秒），仅写入 JSON 元数据
 FRAME_DT = 0.03        # 服务端实际帧间隔（见 src/ws_stream.py 的 _FRAME_INTERVAL）
-MAX_JOINT_VEL = 3.0    # 单关节角速度上限（rad/s）
-# 实测依据：push_left 峰值 3.1 rad/s 时跟踪误差仅约 0.10 rad（成功）；
-# pick_cube 峰值 23.3 rad/s 时执行器物理上无法跟随（失败）。
-# 参见 .trae/documents/telemetry-analysis.md
-FRAMES_MAX = 200       # 单任务帧数上限（远低于规范允许的 500）
+MAX_JOINT_VEL = 1.2    # 单关节角速度上限（rad/s）
+# 2026-10-11 按用户要求整体放慢：服务端帧间隔固定 30ms（src/ws_stream.py 的
+# _FRAME_INTERVAL），所以"放慢"只能靠**增加帧数**实现。上限由 3.0 降到 1.2，
+# 轨迹帧数约增加 2.5 倍，动作更慢、更易观察，也减少"抬臂时把物体蹭倒"。
+# 历史依据：push_left 峰值 3.1 rad/s 时跟踪误差约 0.10 rad；pick_cube 峰值
+# 23.3 rad/s 时执行器物理上无法跟随。参见 .trae/documents/telemetry-analysis.md
+FRAMES_MAX = 400       # 单任务帧数上限（<=500；放慢后需要更多帧）
 
 # IK 求解器**单次迭代**的步长上限（rad）。这是数值求解的稳健性参数，
 # 与"每帧允许移动多少"（MAX_JOINT_VEL × FRAME_DT）是**两回事**：
@@ -414,12 +416,14 @@ def generate_trajectory(keyframes, frames=60):
             traj.append([round(v, 4) for v in keyframes[-1][1]])
     return traj
 
-def cartesian_segment(start_pos, end_pos, target_mat, n_frames, gripper, label=""):
+def cartesian_segment(start_pos, end_pos, target_mat, n_frames, gripper, label="", scale=1.0):
     """笛卡尔空间直线插值：逐帧 IK 求解，TCP 沿直线移动。
 
     **连续性**：第一帧把 TCP 放到 start_pos 并记录得到的关节解，后续帧以
     上一帧的解为 warm_start。这样段内不会跳构型分支。
+    scale 用于整体放慢（帧数按比例放大）。
     """
+    n_frames = max(2, int(round(n_frames * scale)))
     segment = []
     prev_q = None
     for i in range(n_frames):
@@ -436,8 +440,9 @@ def cartesian_segment(start_pos, end_pos, target_mat, n_frames, gripper, label="
         verify_tcp(f"{label}_cart_end")
     return segment
 
-def joint_segment(start_q, end_q, n_frames, gripper):
+def joint_segment(start_q, end_q, n_frames, gripper, scale=1.0):
     """关节空间插值"""
+    n_frames = max(2, int(round(n_frames * scale)))
     segment = []
     for i in range(n_frames):
         t = ease_in_out(i / max(n_frames - 1, 1))
@@ -445,8 +450,9 @@ def joint_segment(start_q, end_q, n_frames, gripper):
         segment.append(q)
     return segment
 
-def hold_segment(qpos, n_frames, gripper):
+def hold_segment(qpos, n_frames, gripper, scale=1.0):
     """保持当前位姿"""
+    n_frames = max(1, int(round(n_frames * scale)))
     return [[round(v, 4) for v in list(qpos) + [gripper]]] * n_frames
 
 
@@ -524,10 +530,34 @@ def save_segments(task_id, instruction, segments, bridge_gripper=None):
     return traj
 
 def save_task(task_id, instruction, keyframes, frames=FRAMES):
-    """关节空间关键帧插值（推球任务）"""
+    """关节空间关键帧插值（推球任务）。
+
+    帧数按**实测峰值速度**迭代放大，直到满足 MAX_JOINT_VEL。
+    仅用公式估算会低估：关键帧之间的时间占比不均（例如"推到终点→回 home"
+    只占 20% 时间却要走最长的一段），实际峰值明显高于均摊值。
+    """
+    frames = frames or FRAMES
     traj = generate_trajectory(keyframes, frames)
+    for _ in range(4):
+        peak = 0.0
+        for i in range(1, len(traj)):
+            peak = max(peak, max(abs(traj[i][k] - traj[i - 1][k]) for k in range(7)))
+        peak_v = peak / FRAME_DT
+        if peak_v <= MAX_JOINT_VEL:
+            break
+        need = int(frames * (peak_v / MAX_JOINT_VEL) * 1.05) + 2
+        if need > FRAMES_MAX:
+            print(f"    [提示] {task_id} 按 {MAX_JOINT_VEL} rad/s 需要 {need} 帧，"
+                  f"超过上限 {FRAMES_MAX}，取上限")
+            need = FRAMES_MAX
+        if need <= frames:
+            break
+        frames = need
+        traj = generate_trajectory(keyframes, frames)
+
     traj, worst = smooth_velocity(traj)
-    print(f"    [平滑] {task_id} 最大 |Δq|={worst:.4f} rad ({worst / FRAME_DT:.2f} rad/s)")
+    print(f"    [帧数] {task_id} 取 {frames} 帧；平滑后最大 |Δq|={worst:.4f} rad "
+          f"({worst / FRAME_DT:.2f} rad/s)")
     trace_velocity(traj, task_id)
     payload = {"i": instruction, "ja": traj, "d": DURATION, "fc": len(traj)}
     path = os.path.join(OUT_DIR, f"{task_id}.json")
@@ -707,37 +737,61 @@ save_segments("pick_cube_001", "pick up the cube", [seg1, seg2, seg3, seg4, seg5
 # 任务 4: place the cube on the shelf（完整抓取+放置流程，笛卡尔直线接近）
 # 注意：本任务在 pick 之后必须把场景恢复到"已知状态"——k1 显式回到 home 位姿，
 # 使工作区里的球/方块被复位，否则两次任务之间的场景状态不可控。
+# 本任务用 retry 循环：若速度仍超限，就把所有段按比例放大后重新生成。
 SHELF_ABOVE = [SHELF_SURFACE[0], SHELF_SURFACE[1], 0.25]
-k1 = joint_segment(home_qpos, ik_cube_above, frames_for_steps(joint_delta(home_qpos, ik_cube_above)), GRIPPER_OPEN)
 
-n_k2 = frames_for_steps(joint_delta(ik_cube_above, ik_cube_touch), min_frames=6)
-set_arm_qpos(ik_cube_above)
-k2 = cartesian_segment(CUBE_ABOVE, CUBE_POS, MAT, n_k2, GRIPPER_OPEN, "place_cube_approach")
 
-k3 = hold_segment(ik_cube_touch, 3, GRIPPER_CLOSED)
+def build_place_shelf(scale=1.0):
+    k1 = joint_segment(home_qpos, ik_cube_above,
+                       frames_for_steps(joint_delta(home_qpos, ik_cube_above)),
+                       GRIPPER_OPEN, scale=scale)
+    n_k2 = frames_for_steps(joint_delta(ik_cube_above, ik_cube_touch), min_frames=6)
+    set_arm_qpos(ik_cube_above)
+    k2 = cartesian_segment(CUBE_ABOVE, CUBE_POS, MAT, n_k2, GRIPPER_OPEN,
+                           "place_cube_approach", scale=scale)
+    k3 = hold_segment(ik_cube_touch, 3, GRIPPER_CLOSED, scale=scale)
+    n_k4 = frames_for_steps(joint_delta(ik_cube_touch, ik_cube_lift), min_frames=6)
+    set_arm_qpos(ik_cube_touch)
+    k4 = cartesian_segment(CUBE_POS, CUBE_LIFT, MAT, n_k4, GRIPPER_CLOSED,
+                           "place_cube_lift", scale=scale)
+    k5 = joint_segment(ik_cube_lift, ik_shelf_above,
+                       frames_for_steps(joint_delta(ik_cube_lift, ik_shelf_above)),
+                       GRIPPER_CLOSED, scale=scale)
+    n_k6 = frames_for_steps(joint_delta(ik_shelf_above, ik_shelf), min_frames=6)
+    set_arm_qpos(ik_shelf_above)
+    k6 = cartesian_segment(SHELF_ABOVE, SHELF_SURFACE, MAT, n_k6, GRIPPER_CLOSED,
+                           "shelf_approach", scale=scale)
+    k7 = hold_segment(ik_shelf, 3, GRIPPER_OPEN, scale=scale)
+    n_k8 = frames_for_steps(joint_delta(ik_shelf, ik_shelf_above), min_frames=6)
+    set_arm_qpos(ik_shelf)
+    k8 = cartesian_segment(SHELF_SURFACE, SHELF_ABOVE, MAT, n_k8, GRIPPER_OPEN,
+                           "shelf_retract", scale=scale)
+    k9 = joint_segment(ik_shelf_above, ik_cube_above,
+                       frames_for_steps(joint_delta(ik_shelf_above, ik_cube_above)),
+                       GRIPPER_OPEN, scale=scale)
+    k10 = joint_segment(ik_cube_above, home_qpos,
+                        frames_for_steps(joint_delta(ik_cube_above, home_qpos)),
+                        GRIPPER_OPEN, scale=scale)
+    segs = [k1, k2, k3, k4, k5, k6, k7, k8, k9, k10]
+    print(f"  place_shelf 分段帧数(scale={scale:.2f}): "
+          f"{'+'.join(str(len(s)) for s in segs)} = {sum(len(s) for s in segs)}")
+    return save_segments("place_shelf_001", "place the cube on the shelf", segs)
 
-n_k4 = frames_for_steps(joint_delta(ik_cube_touch, ik_cube_lift), min_frames=6)
-set_arm_qpos(ik_cube_touch)
-k4 = cartesian_segment(CUBE_POS, CUBE_LIFT, MAT, n_k4, GRIPPER_CLOSED, "place_cube_lift")
 
-k5 = joint_segment(ik_cube_lift, ik_shelf_above, frames_for_steps(joint_delta(ik_cube_lift, ik_shelf_above)), GRIPPER_CLOSED)
-
-n_k6 = frames_for_steps(joint_delta(ik_shelf_above, ik_shelf), min_frames=6)
-set_arm_qpos(ik_shelf_above)
-k6 = cartesian_segment(SHELF_ABOVE, SHELF_SURFACE, MAT, n_k6, GRIPPER_CLOSED, "shelf_approach")
-
-k7 = hold_segment(ik_shelf, 3, GRIPPER_OPEN)
-
-n_k8 = frames_for_steps(joint_delta(ik_shelf, ik_shelf_above), min_frames=6)
-set_arm_qpos(ik_shelf)
-k8 = cartesian_segment(SHELF_SURFACE, SHELF_ABOVE, MAT, n_k8, GRIPPER_OPEN, "shelf_retract")
-
-k9 = joint_segment(ik_shelf_above, ik_cube_above, frames_for_steps(joint_delta(ik_shelf_above, ik_cube_above)), GRIPPER_OPEN)
-k10 = joint_segment(ik_cube_above, home_qpos, frames_for_steps(joint_delta(ik_cube_above, home_qpos)), GRIPPER_OPEN)
-
-print(f"  place_shelf 分段帧数: {len(k1)}+{n_k2}+3+{n_k4}+{len(k5)}+{n_k6}+3+{n_k8}+{len(k9)}+{len(k10)}")
-save_segments("place_shelf_001", "place the cube on the shelf",
-              [k1, k2, k3, k4, k5, k6, k7, k8, k9, k10])
+_scale = 1.0
+for _attempt in range(5):
+    _traj = build_place_shelf(_scale)
+    _peak = 0.0
+    for _i in range(1, len(_traj)):
+        _peak = max(_peak, max(abs(_traj[_i][k] - _traj[_i - 1][k]) for k in range(7)))
+    _peak_v = _peak / FRAME_DT
+    if _peak_v <= MAX_JOINT_VEL * 1.02:
+        break
+    _scale *= 1.4
+    print(f"    [重试] place_shelf 峰值 {_peak_v:.2f} rad/s 仍超限，scale → {_scale:.2f}")
+    if len(_traj) * 1.4 > FRAMES_MAX:
+        print(f"    [停止] 再放大将超过 FRAMES_MAX={FRAMES_MAX}")
+        break
 
 # 任务 5: push ball right
 save_task("push_right_001", "push ball right", [
