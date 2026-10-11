@@ -73,22 +73,47 @@ cd /mnt/e/robot-policy-playground/frontend && npm run build   # 产物复制到 
 cd /mnt/e/robot-policy-playground && npx wrangler deploy
 ```
 
+`npm run build` 的第三段是 [scripts/sync-public.mjs](scripts/sync-public.mjs)：同步产物到
+`public/`，并对全部静态文件做 **25 MiB 单文件上限校验**（免费计划硬限制）。
+超限时它会让构建直接失败并报出文件名与体积，**不会**静默删除——历史上曾用
+"删掉所有 `.wasm`"来绕过 ONNX Runtime 25.6 MiB 超限，结果把问题推迟到线上才暴露
+（见 [troubleshooting-log 问题 21](.trae/documents/troubleshooting-log.md)）。
+确实需要排除某个文件时，在 `sync-public.mjs` 顶部的 `EXCLUDED` 里显式登记原因。
+
 部署需要 `export CLOUDFLARE_API_TOKEN=...`（非交互环境无法 `wrangler login`，
 Token 不持久化）。上线 URL：`https://robot-playground.qmes743628.workers.dev`。
+
+### 仓库里的产物与 `.gitignore` 不一致（已知）
+
+[public/index.html](public/index.html) **是被 git 跟踪的**，而它引用的
+`public/assets/*` 被 [.gitignore](.gitignore) 忽略（第 8 行）。所以刚 clone 出来的仓库
+里有一个指向不存在 asset 的 HTML，必须先执行 `npm run build` 才能跑起来。
+要么把 `public/assets/` 从 `.gitignore` 移除并一并提交，要么把
+`public/index.html` 也忽略掉（因为它是构建产物）——目前是"一半跟踪"的状态。
 
 ## 已知边界与坑
 
 - **没有真实策略**：`/api/infer` 把小写化指令在 [task_index.json](public/data/task_index.json)
   里精确匹配，措辞不同即失败；轨迹是离线 IK 预计算（60 帧/任务，约 3KB/任务），
   无观测输入、无闭环。
-- **单 DO 实例**：所有客户端共用 `idFromName("stream")`，见 [main.py](src/main.py)。
-- **慢网 + QUIC**：67 个 mesh 共约 33MB，慢网下 `workers.dev` 的 HTTP/3 会
-  `ERR_QUIC_PROTOCOL_ERROR 200`，需在浏览器禁用 QUIC 或精简 mesh。
+- **单 DO 实例**：所有客户端共用 `idFromName("stream")`，见 [src/main.py](src/main.py)。
+- **慢网 + QUIC**：67 个 mesh（8 个 .stl + 59 个 .obj，都被 `panda.xml` 引用）共 33.59 MB，
+  且碎片化（`link6` 一个连杆就有 18 个文件）。慢网下 `workers.dev` 的 HTTP/3 会
+  `ERR_QUIC_PROTOCOL_ERROR 200`。**根治方向是把每个 link 的 mesh 合并**（请求数与体积都能大幅下降），
+  "让访客禁用 QUIC"只是临时绕过。
 - **跨域隔离**：MuJoCo 多线程 WASM 需要 COOP/COEP 头，只有 Vite dev server
   和 Cloudflare 线上会带；用普通静态服务器打开会失败。
 
-## 当前仓库状态（需要注意）
+## 关于"代码 / 文档 / 线上"三者的一致性
 
-`.git` 只有 3 个提交，**大量工作尚未提交**（`git status` 显示 15 个已修改文件、
-以及未跟踪的 `scripts/generate_ik_actions.py` 等）。历史文档中若干"已修复/已完成"
-与工作区当前代码不一致，结论要回到代码与 diff 核对。
+这个仓库曾经出现三方不一致，排查时请注意：
+
+- **前端 bundle 是内容寻址的**：`index-CL0HiSH1.js` 这个名字由内容哈希决定。
+  只要源码没变，重新构建会得到**同名同哈希**的文件；因此"线上文件名 == 本地构建文件名"
+  能证明前端已同步，反之则没同步。
+- **但 `public/data/*.json` 不是内容寻址的**：文件名固定，改了内容文件名也不变，
+  无法从文件名判断线上是否是旧数据。验证必须**逐字节比对**（`Invoke-WebRequest`
+  取回后与本地 `ReadAllBytes` 对比字节数与首个差异位置）。
+- 文档里的 ✅ 表示"当时验证通过"，不等于"当前线上如此"。回放后请以
+  **线上实际抓取结果**为准。
+

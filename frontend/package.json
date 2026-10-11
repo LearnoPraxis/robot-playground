@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node -e \"const fs=require('fs'),path=require('path');const dest='../public';fs.copyFileSync('dist/index.html',path.join(dest,'index.html'));const da=path.join(dest,'assets');if(!fs.existsSync(da))fs.mkdirSync(da,{recursive:true});fs.readdirSync(da).filter(f=>f.endsWith('.wasm')).forEach(f=>{fs.unlinkSync(path.join(da,f));console.log('removed:'+f)});fs.readdirSync('dist/assets').filter(f=>!f.endsWith('.wasm')).forEach(f=>{fs.copyFileSync(path.join('dist/assets',f),path.join(da,f));console.log('copied:'+f)});console.log('Build copy done (wasm excluded)');\"",
+    "build": "tsc -b && vite build && node ../scripts/sync-public.mjs",
     "lint": "oxlint",
     "preview": "vite preview"
   },
