@@ -482,7 +482,7 @@ def joint_delta(a, b):
     return max(abs(float(a[k]) - float(b[k])) for k in range(7))
 
 
-def smooth_velocity(traj, max_passes=12, tol=1e-6):
+def smooth_velocity(traj, max_passes=40, tol=1e-6):
     """迭代消除残余速度尖峰。
 
     分段拼接虽然会在大的段边界插入过渡帧，但过渡帧本身可能与相邻段之间
