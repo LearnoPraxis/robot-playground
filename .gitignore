@@ -2,6 +2,8 @@
 node_modules/
 frontend/node_modules/
 src/node_modules/
+# pywrangler sync 会把 Python 依赖装到这里，属于构建产物，不入库
+src/vendor/
 
 # Build output
 frontend/dist/
