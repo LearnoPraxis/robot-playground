@@ -11,6 +11,7 @@ import numpy as np
 import json
 import math
 import os
+import sys
 
 # ── 路径 ──
 BASE = os.path.join(os.path.dirname(__file__), "..")
@@ -886,5 +887,97 @@ task_index = {
 with open(os.path.join(OUT_DIR, "task_index.json"), "w", encoding="utf-8") as f:
     json.dump(task_index, f, ensure_ascii=False, separators=(",", ":"))
 
-print(f"\n生成 5 个任务（IK 求解），每个 {FRAMES} 帧，输出到 {OUT_DIR}")
-print(f"task_index.json 已更新")
+print(f"\n已生成 5 个任务（IK 求解）到 {OUT_DIR}")
+print("task_index.json 已更新")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 离线验证模式：python3 scripts/generate_ik_actions.py --verify [秒/帧]
+#
+# **为什么必须按浏览器的物理节奏验证**（2026-10-11 发现）：
+#   模型自身 timestep = 0.002s，但浏览器里 mujoco-react 的物理循环按真实帧
+#   时间累加推进（`while (data.time - startSimTime < frameTime) mj_step(...)`，
+#   frameTime 上限 1/15）。从用户遥测反推，**每条 30ms 指令帧内实际只推进
+#   约 0.0224s 的物理时间**（≈11 步 @0.002s）。
+#   而先前的手工验证按"整帧 0.03s"推进（15 步），等于给控制器 1.34 倍的
+#   跟踪机会——于是离线看起来成功、浏览器里失败。
+#   默认值取 0.0224s（实测中位），可用参数覆盖对比。
+# ══════════════════════════════════════════════════════════════════
+PHYSICS_PER_FRAME = 0.0224
+
+
+def _replay_one(model, data, traj, box_name, physics_per_frame):
+    """按"每条指令帧推进多少物理时间"回放一条轨迹。
+
+    返回 (起始高度, 峰值高度, 高位保持帧数, 是否出现双侧手指接触, 最大位移)。
+    """
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, box_name)
+    if bid < 0:
+        return None
+    lf = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_finger")
+    rf = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_finger")
+    mujoco.mj_resetDataKeyframe(model, data, 0)
+    mujoco.mj_forward(model, data)
+    start = data.xpos[bid].copy()
+    peak = float(start[2])
+    hi = 0
+    both = False
+    nsteps = max(1, int(round(physics_per_frame / model.opt.timestep)))
+    for row in traj:
+        for j in range(8):
+            data.ctrl[j] = row[j] if j < 7 else row[7] * 255.0
+        for _ in range(nsteps):
+            mujoco.mj_step(model, data)
+            nl = nr = 0
+            for c in range(data.ncon):
+                b1 = model.geom_bodyid[data.contact[c].geom1]
+                b2 = model.geom_bodyid[data.contact[c].geom2]
+                if bid in (b1, b2):
+                    o = b2 if b1 == bid else b1
+                    if o == lf:
+                        nl += 1
+                    elif o == rf:
+                        nr += 1
+            if nl > 0 and nr > 0:
+                both = True
+        z = float(data.xpos[bid][2])
+        peak = max(peak, z)
+        if z > start[2] + 0.10:
+            hi += 1
+    disp = float(np.linalg.norm(data.xpos[bid] - start))
+    return float(start[2]), peak, hi, both, disp
+
+
+if "--verify" in sys.argv:
+    idx = sys.argv.index("--verify")
+    ppf = float(sys.argv[idx + 1]) if len(sys.argv) > idx + 1 else PHYSICS_PER_FRAME
+    print()
+    print("=" * 74)
+    print(f"离线验证：每条指令帧推进 {ppf:.4f}s 物理时间"
+          f"（{max(1, int(round(ppf / model.opt.timestep)))} 步 @ {model.opt.timestep}s/步）")
+    print(f"  浏览器实测中位值 = {PHYSICS_PER_FRAME:.4f}s；"
+          f"取 0.03s 即为'整帧'（会高估，勿用于判定）")
+    print("=" * 74)
+    print(f"{'任务':<20}{'物体':<7}{'起点z':>9}{'峰值z':>9}{'抬高':>9}"
+          f"{'保持帧':>8}{'双侧':>6}{'位移':>9}")
+    vmodel = mujoco.MjModel.from_xml_path(SCENE_XML)
+    vdata = mujoco.MjData(vmodel)
+    for tid, obj in (("pick_cube_001", "cube"),
+                     ("place_shelf_001", "cube"),
+                     ("push_left_001", "ball"),
+                     ("push_right_001", "ball"),
+                     ("push_forward_001", "ball")):
+        p = os.path.join(OUT_DIR, f"{tid}.json")
+        if not os.path.exists(p):
+            continue
+        traj = json.load(open(p, encoding="utf-8"))["ja"]
+        res = _replay_one(vmodel, vdata, traj, obj, ppf)
+        if res is None:
+            continue
+        z0, peak, hi, both, disp = res
+        print(f"{tid:<20}{obj:<7}{z0:>9.4f}{peak:>9.4f}{(peak - z0) * 100:>8.1f}cm"
+              f"{hi:>8}{('是' if both else '否'):>6}{disp * 100:>8.1f}cm")
+    print()
+    print("判据：抓取任务看'抬高'与'保持帧'（方块应被抬起数十厘米并保持）；")
+    print("      推球任务看'位移'（球应被推移约 20cm 量级）与'双侧'（夹爪确实夹住过）。")
+
