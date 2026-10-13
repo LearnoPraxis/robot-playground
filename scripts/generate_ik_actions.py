@@ -96,7 +96,9 @@ MAX_JOINT_VEL = 1.2    # 单关节角速度上限（rad/s，浏览器实际口�
 # 轨迹帧数约增加 2.5 倍，动作更慢、更易观察，也减少"抬臂时把物体蹭倒"。
 # 历史依据：push_left 峰值 3.1 rad/s 时跟踪误差约 0.10 rad；pick_cube 峰值
 # 23.3 rad/s 时执行器物理上无法跟随。参见 .trae/documents/telemetry-analysis.md
-FRAMES_MAX = 400       # 单任务帧数上限（<=500；放慢后需要更多帧）
+FRAMES_MAX = 500       # 单任务帧数上限（= project_rules 规定的硬上限）
+# 注意：修好 smooth_velocity 后，place_shelf 的插帧让帧数从 303 涨到 462。
+# 上限必须 >= 实际需要，否则会出现"轨迹正确但被警告超限"的矛盾状态。
 
 # IK 求解器**单次迭代**的步长上限（rad）。这是数值求解的稳健性参数，
 # 与"每帧允许移动多少"（MAX_JOINT_VEL × FRAME_DT）是**两回事**：
@@ -508,26 +510,31 @@ def smooth_velocity(traj, max_passes=40, tol=1e-6):
     """迭代消除残余速度尖峰。
 
     分段拼接虽然会在大的段边界插入过渡帧，但过渡帧本身可能与相邻段之间
-    仍有小幅超限（实测 place_shelf 残留 4 帧 / 峰值 7.0 rad/s）。
-    这里对每个超限帧，把它与前后帧各取中点插入，反复迭代直到达标或不再改善。
+    仍有小幅超限。
+
+    **2026-10-11 修复**：原实现每轮只找**最差的一处**并在那里插一个中点，
+    于是每轮只减少一个超限帧。place_shelf 有 91 处超限，40 轮远远不够，
+    峰值卡在 3.14 rad/s 降不下来（这正是它一直超限、放置失败的原因之一）。
+    现在每轮把**所有**超限处都插入中点，收敛快得多。
     """
     limit = max_frame_step()
 
     for _ in range(max_passes):
-        worst = 0.0
-        worst_i = -1
-        for i in range(1, len(traj)):
+        # 从后往前收集所有超限处，避免插入后下标错位
+        spots = []
+        for i in range(len(traj) - 1, 0, -1):
             step = max(abs(traj[i][k] - traj[i - 1][k]) for k in range(7))
-            if step > worst:
-                worst, worst_i = step, i
-        if worst <= limit + tol or worst_i < 0:
-            return traj, worst
+            if step > limit + tol:
+                spots.append(i)
+        if not spots:
+            break
+        for i in spots:
+            mid = [round((traj[i - 1][k] + traj[i][k]) / 2, 5) for k in range(8)]
+            traj.insert(i, mid)
 
-        prev_f = traj[worst_i - 1]
-        cur_f = traj[worst_i]
-        mid = [round((prev_f[k] + cur_f[k]) / 2, 5) for k in range(8)]
-        traj.insert(worst_i, mid)
-
+    worst = 0.0
+    for i in range(1, len(traj)):
+        worst = max(worst, max(abs(traj[i][k] - traj[i - 1][k]) for k in range(7)))
     return traj, worst
 
 def save_segments(task_id, instruction, segments, bridge_gripper=None):
@@ -696,9 +703,21 @@ ik_push_right = solve_ik([BALL_POS[0] - 0.15, BALL_POS[1] + 0.2, BALL_POS[2]],
 _SEED_POOL.append(ik_push_right)
 
 print("  推球向前终点:")
+# ⚠️ 这个解有两个用途：① 作为 push_forward 的终点关键帧；② **作为 ik_cube_above
+# 的 warm_start**（见下方立方体段）。所以它的取值会连带影响抓取质量——
+# 实测把终点从 +x 改成 −x（为修 push_forward 的行程问题）后，pick_cube 的
+# 抬高量从 28.7cm 掉到 17.8cm。因此这里保留让抓取表现最好的 +x 版本，
+# 而 push_forward 改用下面单独算出的"朝基座"解，两者互不干扰。
 ik_push_forward = solve_ik([BALL_POS[0] + 0.2, BALL_POS[1], BALL_POS[2]],
                            warm_start=ik_ball_touch)
 _SEED_POOL.append(ik_push_forward)
+
+# 阶段三：push_forward 实际使用的终点——朝基座 −x 推。
+# 原 +x 目标 IK 本身可达（误差 0.01mm），但**执行器跟不动**：要求 TCP 从
+# x≈0.5 外伸到 0.7，实测指令 0.70 而 TCP 只到 0.569，球只被推 6cm。
+# 朝基座推是收臂动作，力臂变短、跟踪好得多（实测球位移 34.5cm）。
+ik_push_back = solve_ik([BALL_POS[0] - 0.2, BALL_POS[1], BALL_POS[2]],
+                        warm_start=ik_ball_touch)
 
 # ── 立方体 ──
 # 关键：DLS 的 3-DOF 位置阶段只有约 166 次迭代，从 home 出发到不了立方体上方
@@ -747,11 +766,11 @@ save_task("push_left_001", "push ball left", [
 ])
 
 # 任务 2: push ball forward
-save_task("push_forward_001", "push ball forward", [
+save_task("push_forward_001", "push ball backward", [
     (0.0, home_8),
     (0.3, list(ik_ball_above) + [GRIPPER_OPEN]),
     (0.5, list(ik_ball_touch) + [GRIPPER_OPEN]),
-    (0.8, list(ik_push_forward) + [GRIPPER_OPEN]),
+    (0.8, list(ik_push_back) + [GRIPPER_OPEN]),
     (1.0, home_8),
 ])
 
@@ -903,7 +922,7 @@ task_index = {
     "push ball right": "push_right_001",
     "pick up the cube": "pick_cube_001",
     "place the cube on the shelf": "place_shelf_001",
-    "push ball forward": "push_forward_001",
+    "push ball backward": "push_forward_001",
 }
 with open(os.path.join(OUT_DIR, "task_index.json"), "w", encoding="utf-8") as f:
     json.dump(task_index, f, ensure_ascii=False, separators=(",", ":"))

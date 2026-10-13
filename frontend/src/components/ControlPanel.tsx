@@ -6,7 +6,7 @@ const PRESET_INSTRUCTIONS = [
   "push ball right",
   "pick up the cube",
   "place the cube on the shelf",
-  "push ball forward",
+  "push ball backward",
 ];
 
 interface ControlPanelProps {
