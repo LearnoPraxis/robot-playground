@@ -82,8 +82,15 @@ _SEED_POOL = []
 
 FRAMES = 60            # 默认帧数（推球等平滑任务）
 DURATION = 2.0         # 名义时长（秒），仅写入 JSON 元数据
-FRAME_DT = 0.03        # 服务端实际帧间隔（见 src/ws_stream.py 的 _FRAME_INTERVAL）
-MAX_JOINT_VEL = 1.2    # 单关节角速度上限（rad/s）
+FRAME_DT = 0.03        # 服务端帧间隔（见 src/ws_stream.py 的 _FRAME_INTERVAL）
+# ── 关键：指令帧 ≠ 仿真帧 ──
+# 服务端按 30ms **实时期**推帧，但浏览器仿真每帧只推进约这么久的物理时间。
+# 由用户遥测实测（t/step 反推）中位 0.0224s（≈75% 实时）：浏览器物理吞吐被
+# mj_step 成本卡住，稳在约 45 步/秒，追不上 30ms 的实时节奏。
+# 因此帧间允许的关节变化必须按**浏览器实际推进的物理时间**折算，
+# 否则生成器眼里的 1.2 rad/s 在浏览器里等效于 1.2×0.03/0.0224 ≈ 1.61 rad/s。
+BROWSER_PHYSICS_PER_FRAME = 0.0224
+MAX_JOINT_VEL = 1.2    # 单关节角速度上限（rad/s，浏览器实际口径）
 # 2026-10-11 按用户要求整体放慢：服务端帧间隔固定 30ms（src/ws_stream.py 的
 # _FRAME_INTERVAL），所以"放慢"只能靠**增加帧数**实现。上限由 3.0 降到 1.2，
 # 轨迹帧数约增加 2.5 倍，动作更慢、更易观察，也减少"抬臂时把物体蹭倒"。
@@ -100,8 +107,22 @@ IK_MAX_ITER_STEP = 0.15
 
 
 def max_frame_step():
-    """单帧允许的最大关节变化量（rad）。"""
-    return MAX_JOINT_VEL * FRAME_DT
+    """单帧允许的最大关节变化量（rad）。
+
+    按**浏览器实际推进的物理时间**折算，而不是服务端 30ms 的实时期：
+    仿真是"慢放"的，用 30ms 折算会让轨迹在浏览器里系统性偏快 1.34×。
+    """
+    return MAX_JOINT_VEL * BROWSER_PHYSICS_PER_FRAME
+
+
+def browser_velocity(step_per_frame):
+    """把"每帧关节变化量"换算成浏览器里实际发生的角速度（rad/s）。"""
+    return step_per_frame / BROWSER_PHYSICS_PER_FRAME
+
+
+def nominal_velocity(step_per_frame):
+    """按服务端实时期折算的角速度——**仅用于参考，不要用来判定**。"""
+    return step_per_frame / FRAME_DT
 
 
 def frames_for_steps(max_delta, min_frames=4):
@@ -126,17 +147,17 @@ def trace_velocity(traj, label=""):
             worst = step
         if step > max_frame_step() + 1e-9:
             violations.append((i, step))
-    peak_v = worst / FRAME_DT
+    peak_v = browser_velocity(worst)
     if violations:
-        print(f"    [速度校验{(' ' + label) if label else ''}] ✗ 峰值 {peak_v:.1f} rad/s，"
-              f"{len(violations)} 帧超限（上限 {MAX_JOINT_VEL} rad/s）")
+        print(f"    [速度校验{(' ' + label) if label else ''}] ✗ 峰值 {peak_v:.2f} rad/s"
+              f"（浏览器口径），{len(violations)} 帧超限（上限 {MAX_JOINT_VEL} rad/s）")
         for i, step in violations[:6]:
-            print(f"        帧 {i}: |Δq|={step:.4f} rad → {step / FRAME_DT:.1f} rad/s")
+            print(f"        帧 {i}: |Δq|={step:.4f} rad → {browser_velocity(step):.2f} rad/s")
         if len(violations) > 6:
             print(f"        … 其余 {len(violations) - 6} 帧省略")
     else:
         print(f"    [速度校验{(' ' + label) if label else ''}] ✓ 峰值 {peak_v:.2f} rad/s "
-              f"(上限 {MAX_JOINT_VEL})")
+              f"(浏览器口径，上限 {MAX_JOINT_VEL})")
     return worst, peak_v, violations
 
 
@@ -901,9 +922,8 @@ print("task_index.json 已更新")
 #   约 0.0224s 的物理时间**（≈11 步 @0.002s）。
 #   而先前的手工验证按"整帧 0.03s"推进（15 步），等于给控制器 1.34 倍的
 #   跟踪机会——于是离线看起来成功、浏览器里失败。
-#   默认值取 0.0224s（实测中位），可用参数覆盖对比。
+#   默认值取 BROWSER_PHYSICS_PER_FRAME（唯一真源，见文件顶部常量）。
 # ══════════════════════════════════════════════════════════════════
-PHYSICS_PER_FRAME = 0.0224
 
 
 def _replay_one(model, data, traj, box_name, physics_per_frame):
@@ -950,12 +970,13 @@ def _replay_one(model, data, traj, box_name, physics_per_frame):
 
 if "--verify" in sys.argv:
     idx = sys.argv.index("--verify")
-    ppf = float(sys.argv[idx + 1]) if len(sys.argv) > idx + 1 else PHYSICS_PER_FRAME
+    ppf = (float(sys.argv[idx + 1]) if len(sys.argv) > idx + 1
+           else BROWSER_PHYSICS_PER_FRAME)
     print()
     print("=" * 74)
     print(f"离线验证：每条指令帧推进 {ppf:.4f}s 物理时间"
           f"（{max(1, int(round(ppf / model.opt.timestep)))} 步 @ {model.opt.timestep}s/步）")
-    print(f"  浏览器实测中位值 = {PHYSICS_PER_FRAME:.4f}s；"
+    print(f"  浏览器实测中位值 = {BROWSER_PHYSICS_PER_FRAME:.4f}s；"
           f"取 0.03s 即为'整帧'（会高估，勿用于判定）")
     print("=" * 74)
     print(f"{'任务':<20}{'物体':<7}{'起点z':>9}{'峰值z':>9}{'抬高':>9}"
